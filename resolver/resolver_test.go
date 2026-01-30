@@ -57,7 +57,7 @@ func TestIPV4(t *testing.T) {
 	ips, err := ResolveA("www.baidu.com", WithDoT(DotDnspod), WithTimeout(5*time.Second), WithECS("222.246.50.25"))
 	r.NoError(err)
 	t.Log(ips)
-	ips, err = ResolveA("www.baidu.com", WithDoH(DohDnspod), WithECS("42.121.2.24"))
+	ips, err = ResolveA("www.baidu.com", WithDoH(DoHDnspod), WithECS("42.121.2.24"))
 	r.NoError(err)
 	t.Log(ips)
 	ips, err = ResolveA("www.baidu.com", WithDNSServer("1.1.1.1"), WithECS("222.246.50.25", "42.121.2.24"))

@@ -18,12 +18,12 @@ const (
 	DoTGoogle     = "dns.google:853"
 	DoTQuad9      = "dns.quad9.net:853"
 	DotDnspod     = "dot.pub:853"
-	Dot360        = "dot.360.cn:853"
+	DoT360        = "dot.360.cn:853"
 
 	// DoH (DNS over HTTPS)
 	DoHCloudflare = "https://cloudflare-dns.com/dns-query"
 	DoHGoogle     = "https://dns.google/dns-query"
 	DoHQuad9      = "https://dns.quad9.net/dns-query"
-	DohDnspod     = "https://sm2.doh.pub/dns-query"
+	DoHDnspod     = "https://sm2.doh.pub/dns-query"
 	DoH360        = "https://doh.360.cn/dns-query"
 )
