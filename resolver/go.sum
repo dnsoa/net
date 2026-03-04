@@ -1,4 +1,2 @@
-github.com/dnsoa/go/assert v1.1.2 h1:NVtMqxq3IoS17NGKoYH9Mc/vASQa5psMo7X/i+gwzyE=
-github.com/dnsoa/go/assert v1.1.2/go.mod h1:aP8iaHTcw49posUgXy9qjr/ICSJ2HNjyQXNOJzo4Zws=
 github.com/phuslu/fastdns v0.16.5 h1:tSJVyuPiJWMNEsdw+OUAztxRzBA7OJiHe3sQ7ZjMZAE=
 github.com/phuslu/fastdns v0.16.5/go.mod h1:whxYhN/LvgE3EK+n2E73vt5CY44cZVbk6j9ZsqE8G3Q=
