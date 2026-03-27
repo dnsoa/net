@@ -524,7 +524,7 @@ func (c *QpackCodec) EncodeFields(fields []HeaderField) ([]byte, error) {
 	body := make([]byte, 0, len(fields)*16)
 	requiredInsertCount := uint64(0)
 	for _, field := range fields {
-		if idx, ok := findStaticNameValue(field.Name, field.Value); ok {
+		if idx, ok := findStaticNameValueFast(field.Name, field.Value); ok {
 			body = appendPrefixedInt(body, 6, 0xC0, uint64(idx))
 			continue
 		}
@@ -544,7 +544,7 @@ func (c *QpackCodec) EncodeFields(fields []HeaderField) ([]byte, error) {
 		if c.shouldInsertDynamic(field) {
 			c.queueInsertLocked(field)
 		}
-		if idx, ok := findStaticName(field.Name); ok {
+		if idx, ok := findStaticNameFast(field.Name); ok {
 			body = appendPrefixedInt(body, 4, 0x50, uint64(idx))
 			body = appendQpackString(body, field.Value)
 			continue
@@ -684,7 +684,7 @@ func (c *QpackCodec) shouldInsertDynamic(field HeaderField) bool {
 	if c.localCapacity == 0 || strings.HasPrefix(field.Name, ":") {
 		return false
 	}
-	if _, ok := findStaticNameValue(field.Name, field.Value); ok {
+	if _, ok := findStaticNameValueFast(field.Name, field.Value); ok {
 		return false
 	}
 	if _, ok := c.localTable.findNameValue(field.Name, field.Value, c.localTable.insertCount); ok {
@@ -695,7 +695,7 @@ func (c *QpackCodec) shouldInsertDynamic(field HeaderField) bool {
 
 func (c *QpackCodec) queueInsertLocked(field HeaderField) {
 	start := len(c.pendingEncoder)
-	if idx, ok := findStaticName(field.Name); ok {
+	if idx, ok := findStaticNameFast(field.Name); ok {
 		c.pendingEncoder = appendPrefixedInt(c.pendingEncoder, 6, 0xC0, uint64(idx))
 		c.pendingEncoder = appendQpackString(c.pendingEncoder, field.Value)
 	} else {
@@ -730,22 +730,35 @@ func resolvePostBaseEntry(table qpackDynamicTable, base uint64, postBaseIndex ui
 	return table.getAbsolute(base + postBaseIndex)
 }
 
-func findStaticNameValue(name, value string) (int, bool) {
+var getStaticTableMap = sync.OnceValue(func() map[string]int {
+	return buildStaticTableMap()
+})
+
+func buildStaticTableMap() map[string]int {
+	m := make(map[string]int, len(qpackStaticTable)*2)
 	for idx, entry := range qpackStaticTable {
-		if entry.name == name && entry.value == value {
-			return idx, true
+		// Exact match key
+		m[entry.name+"\x00"+entry.value] = idx
+		// Name-only key (use highest index for name-only matches)
+		if existingIdx, exists := m[entry.name+"\x00"]; !exists || idx > existingIdx {
+			m[entry.name+"\x00"] = idx
 		}
 	}
-	return 0, false
+	return m
 }
 
-func findStaticName(name string) (int, bool) {
-	for idx, entry := range qpackStaticTable {
-		if entry.name == name {
-			return idx, true
-		}
-	}
-	return 0, false
+// findStaticNameValueFast uses map lookup for O(1) performance
+func findStaticNameValueFast(name, value string) (int, bool) {
+	m := getStaticTableMap()
+	idx, ok := m[name+"\x00"+value]
+	return idx, ok
+}
+
+// findStaticNameFast uses map lookup for O(1) performance
+func findStaticNameFast(name string) (int, bool) {
+	m := getStaticTableMap()
+	idx, ok := m[name+"\x00"]
+	return idx, ok
 }
 
 func appendQpackString(dst []byte, value string) []byte {

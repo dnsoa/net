@@ -1,4 +1,4 @@
-package httpx
+package httpx_test
 
 import (
 	"testing"
