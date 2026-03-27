@@ -1,31 +1,9 @@
 package core
 
-import "strconv"
-
-func asciiLower(b byte) byte {
-	if b >= 'A' && b <= 'Z' {
-		return b + ('a' - 'A')
-	}
-	return b
-}
-
-// ASCIEqualFold reports whether two ASCII byte slices are equal, ignoring case.
-func ASCIEqualFold(a, b []byte) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if asciiLower(a[i]) != asciiLower(b[i]) {
-			return false
-		}
-	}
-	return true
-}
-
-// asciiEqualFold is the internal lowercase version used within core package.
-func asciiEqualFold(a, b []byte) bool {
-	return ASCIEqualFold(a, b)
-}
+import (
+	"bytes"
+	"strconv"
+)
 
 // ContainsTokenCI reports whether haystack contains needle as a token,
 // comparing case-insensitively. Tokens are delimited by commas and optional whitespace.
@@ -46,7 +24,7 @@ func ContainsTokenCI(haystack, needle []byte) bool {
 		for len(token) > 0 && token[len(token)-1] == ' ' {
 			token = token[:len(token)-1]
 		}
-		if ASCIEqualFold(token, needle) {
+		if bytes.EqualFold(token, needle) {
 			return true
 		}
 		start = end + 1

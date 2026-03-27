@@ -76,7 +76,7 @@ func (h *Headers) SetString(name, value string) {
 func (h *Headers) Get(name string) []byte {
 	needle := []byte(name)
 	for i := range h.entries {
-		if asciiEqualFold(h.entries[i].Name, needle) {
+		if bytes.EqualFold(h.entries[i].Name, needle) {
 			return h.entries[i].Value
 		}
 	}
@@ -91,7 +91,7 @@ func (h *Headers) GetAll(name string) [][]byte {
 	needle := []byte(name)
 	values := make([][]byte, 0, 2)
 	for i := range h.entries {
-		if asciiEqualFold(h.entries[i].Name, needle) {
+		if bytes.EqualFold(h.entries[i].Name, needle) {
 			values = append(values, h.entries[i].Value)
 		}
 	}
@@ -101,7 +101,7 @@ func (h *Headers) GetAll(name string) [][]byte {
 func (h *Headers) RemoveAll(name []byte) {
 	out := h.entries[:0]
 	for _, entry := range h.entries {
-		if asciiEqualFold(entry.Name, name) {
+		if bytes.EqualFold(entry.Name, name) {
 			h.pool.Put(entry.backing)
 			continue
 		}

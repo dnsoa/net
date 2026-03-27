@@ -1,6 +1,9 @@
 package core
 
-import "time"
+import (
+	"bytes"
+	"time"
+)
 
 type Method uint8
 
@@ -40,35 +43,35 @@ func (m Method) String() string {
 func ParseMethodBytes(raw []byte) (Method, bool) {
 	switch len(raw) {
 	case 3:
-		if asciiEqualFold(raw, []byte("GET")) {
+		if bytes.EqualFold(raw, []byte("GET")) {
 			return MethodGet, true
 		}
-		if asciiEqualFold(raw, []byte("PUT")) {
+		if bytes.EqualFold(raw, []byte("PUT")) {
 			return MethodPut, true
 		}
 	case 4:
-		if asciiEqualFold(raw, []byte("POST")) {
+		if bytes.EqualFold(raw, []byte("POST")) {
 			return MethodPost, true
 		}
-		if asciiEqualFold(raw, []byte("HEAD")) {
+		if bytes.EqualFold(raw, []byte("HEAD")) {
 			return MethodHead, true
 		}
 	case 5:
-		if asciiEqualFold(raw, []byte("PATCH")) {
+		if bytes.EqualFold(raw, []byte("PATCH")) {
 			return MethodPatch, true
 		}
-		if asciiEqualFold(raw, []byte("TRACE")) {
+		if bytes.EqualFold(raw, []byte("TRACE")) {
 			return MethodTrace, true
 		}
 	case 6:
-		if asciiEqualFold(raw, []byte("DELETE")) {
+		if bytes.EqualFold(raw, []byte("DELETE")) {
 			return MethodDelete, true
 		}
 	case 7:
-		if asciiEqualFold(raw, []byte("CONNECT")) {
+		if bytes.EqualFold(raw, []byte("CONNECT")) {
 			return MethodConnect, true
 		}
-		if asciiEqualFold(raw, []byte("OPTIONS")) {
+		if bytes.EqualFold(raw, []byte("OPTIONS")) {
 			return MethodOptions, true
 		}
 	}
@@ -127,14 +130,14 @@ func (v Version) String() string {
 
 func ParseVersionBytes(raw []byte) (Version, bool) {
 	for idx, name := range versionNames {
-		if asciiEqualFold(raw, []byte(name)) {
+		if bytes.EqualFold(raw, []byte(name)) {
 			return Version(idx), true
 		}
 	}
-	if asciiEqualFold(raw, []byte("HTTP/2.0")) {
+	if bytes.EqualFold(raw, []byte("HTTP/2.0")) {
 		return VersionHTTP2, true
 	}
-	if asciiEqualFold(raw, []byte("HTTP/3.0")) {
+	if bytes.EqualFold(raw, []byte("HTTP/3.0")) {
 		return VersionHTTP3, true
 	}
 	return VersionHTTP11, false

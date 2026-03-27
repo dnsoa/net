@@ -1,6 +1,7 @@
 package http2
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"io"
@@ -52,7 +53,7 @@ func NegotiateVersion(alpn []byte) NegotiatedProtocol {
 
 func IsH2CUpgradeRequest(headers *core.Headers) bool {
 	upgrade := headers.Get("Upgrade")
-	if upgrade == nil || !core.ASCIEqualFold(upgrade, []byte("h2c")) {
+	if upgrade == nil || !bytes.EqualFold(upgrade, []byte("h2c")) {
 		return false
 	}
 	connection := headers.Get("Connection")

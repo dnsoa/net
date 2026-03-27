@@ -96,17 +96,17 @@ func (u URI) EffectivePort() uint16 {
 	if u.HasPort {
 		return u.Port
 	}
-	if asciiEqualFold(u.Scheme, []byte("https")) || asciiEqualFold(u.Scheme, []byte("wss")) {
+	if bytes.EqualFold(u.Scheme, []byte("https")) || bytes.EqualFold(u.Scheme, []byte("wss")) {
 		return 443
 	}
-	if asciiEqualFold(u.Scheme, []byte("ftp")) {
+	if bytes.EqualFold(u.Scheme, []byte("ftp")) {
 		return 21
 	}
 	return 80
 }
 
 func (u URI) IsTLS() bool {
-	return asciiEqualFold(u.Scheme, []byte("https")) || asciiEqualFold(u.Scheme, []byte("wss"))
+	return bytes.EqualFold(u.Scheme, []byte("https")) || bytes.EqualFold(u.Scheme, []byte("wss"))
 }
 
 func (u URI) RequestTarget(dst []byte) []byte {
