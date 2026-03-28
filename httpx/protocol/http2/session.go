@@ -1,6 +1,7 @@
 package http2
 
 import (
+	"bytes"
 	"errors"
 	"io"
 
@@ -11,7 +12,6 @@ type Session struct {
 	conn              *Conn
 	streams           *StreamManager
 	maxReadFrameSize  int
-	pool              *core.BytePool
 	incomingRequests  map[uint32]*incomingRequest
 	incomingResponses map[uint32]*incomingResponse
 }
@@ -46,7 +46,6 @@ func newSession(conn *Conn, isClient bool) *Session {
 		conn:              conn,
 		streams:           NewStreamManager(isClient, conn.Settings, conn.PeerSettings),
 		maxReadFrameSize:  int(conn.PeerSettings.MaxFrameSize),
-		pool:              core.DefaultBytePool,
 		incomingRequests:  make(map[uint32]*incomingRequest),
 		incomingResponses: make(map[uint32]*incomingResponse),
 	}
@@ -57,8 +56,9 @@ func (s *Session) WriteRequest(req *core.Request) (uint32, error) {
 	if err != nil {
 		return 0, err
 	}
+	body, _ := req.ReadAll()
 	hasTrailers := req.Trailers.Count() > 0
-	endStream := len(req.Body) == 0 && !hasTrailers
+	endStream := len(body) == 0 && !hasTrailers
 	headers, err := s.streams.BuildRequestHeaderFrames(stream.ID, req, endStream)
 	if err != nil {
 		return 0, err
@@ -71,8 +71,8 @@ func (s *Session) WriteRequest(req *core.Request) (uint32, error) {
 	if endStream {
 		return stream.ID, nil
 	}
-	if len(req.Body) > 0 {
-		dataFrames, err := s.streams.BuildDataFrames(stream.ID, req.Body, !hasTrailers)
+	if len(body) > 0 {
+		dataFrames, err := s.streams.BuildDataFrames(stream.ID, body, !hasTrailers)
 		if err != nil {
 			return 0, err
 		}
@@ -118,7 +118,9 @@ func (s *Session) ReadRequest() (uint32, *core.Request, error) {
 				}
 				pending.request.Trailers = trailers
 				if decoded.EndStream {
-					pending.request.Body = pending.body
+					body := pending.body
+					pending.request.Body = io.NopCloser(bytes.NewReader(body))
+					pending.request.ContentLength = int64(len(body))
 					delete(s.incomingRequests, decoded.StreamID)
 					return decoded.StreamID, pending.request, nil
 				}
@@ -141,9 +143,11 @@ func (s *Session) ReadRequest() (uint32, *core.Request, error) {
 				return 0, nil, err
 			}
 			pending.seenData = true
-			pending.body = appendBody(s.pool, pending.body, frame.Payload)
+			pending.body = append(pending.body, frame.Payload...)
 			if frame.Header.Flags&FlagEndStream != 0 {
-				pending.request.Body = pending.body
+				body := pending.body
+				pending.request.Body = io.NopCloser(bytes.NewReader(body))
+				pending.request.ContentLength = int64(len(body))
 				delete(s.incomingRequests, frame.Header.StreamID)
 				return frame.Header.StreamID, pending.request, nil
 			}
@@ -165,8 +169,9 @@ func (s *Session) ReadRequest() (uint32, *core.Request, error) {
 }
 
 func (s *Session) WriteResponse(streamID uint32, resp *core.Response) error {
+	body, _ := resp.ReadAll()
 	hasTrailers := resp.Trailers.Count() > 0
-	endStream := (len(resp.Body) == 0 || !resp.Status.MayHaveBody()) && !hasTrailers
+	endStream := (len(body) == 0 || !resp.Status.MayHaveBody()) && !hasTrailers
 	headers, err := s.streams.BuildResponseHeaderFrames(streamID, resp, endStream)
 	if err != nil {
 		return err
@@ -179,8 +184,8 @@ func (s *Session) WriteResponse(streamID uint32, resp *core.Response) error {
 	if endStream {
 		return nil
 	}
-	if len(resp.Body) > 0 && resp.Status.MayHaveBody() {
-		dataFrames, err := s.streams.BuildDataFrames(streamID, resp.Body, !hasTrailers)
+	if len(body) > 0 && resp.Status.MayHaveBody() {
+		dataFrames, err := s.streams.BuildDataFrames(streamID, body, !hasTrailers)
 		if err != nil {
 			return err
 		}
@@ -226,7 +231,9 @@ func (s *Session) ReadResponse() (uint32, *core.Response, error) {
 				}
 				pending.response.Trailers = trailers
 				if decoded.EndStream {
-					pending.response.Body = pending.body
+					body := pending.body
+					pending.response.Body = io.NopCloser(bytes.NewReader(body))
+					pending.response.ContentLength = int64(len(body))
 					delete(s.incomingResponses, decoded.StreamID)
 					return decoded.StreamID, pending.response, nil
 				}
@@ -249,9 +256,11 @@ func (s *Session) ReadResponse() (uint32, *core.Response, error) {
 				return 0, nil, err
 			}
 			pending.seenData = true
-			pending.body = appendBody(s.pool, pending.body, frame.Payload)
+			pending.body = append(pending.body, frame.Payload...)
 			if frame.Header.Flags&FlagEndStream != 0 {
-				pending.response.Body = pending.body
+				body := pending.body
+				pending.response.Body = io.NopCloser(bytes.NewReader(body))
+				pending.response.ContentLength = int64(len(body))
 				delete(s.incomingResponses, frame.Header.StreamID)
 				return frame.Header.StreamID, pending.response, nil
 			}
@@ -311,15 +320,4 @@ func (s *Session) applyRemoteSettings(frame Frame) error {
 		return s.conn.WriteFrame(FrameHeader{Type: FrameSettings, Flags: FlagAck, StreamID: 0}, nil)
 	}
 	return nil
-}
-
-func appendBody(pool *core.BytePool, dst, chunk []byte) []byte {
-	if len(chunk) == 0 {
-		return dst
-	}
-	if pool == nil {
-		pool = core.DefaultBytePool
-	}
-	dst = pool.Grow(dst, len(chunk))
-	return append(dst, chunk...)
 }

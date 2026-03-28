@@ -2,6 +2,7 @@ package http1
 
 import (
 	"bytes"
+	"io"
 	"testing"
 
 	"github.com/dnsoa/net/httpx/core"
@@ -14,8 +15,9 @@ func TestFormatRequestAddsContentLength(t *testing.T) {
 	if err := req.Init(core.MethodPost, "https://example.com/upload"); err != nil {
 		t.Fatalf("init request: %v", err)
 	}
-	req.Body = []byte("hello")
-	encoded := FormatRequest(req, nil)
+	req.SetBody(io.NopCloser(bytes.NewReader([]byte("hello"))))
+	body, _ := req.ReadAll()
+	encoded := FormatRequest(req, body, nil)
 	if !bytes.Contains(encoded, []byte("Content-Length: 5\r\n")) {
 		t.Fatalf("missing content-length in request: %q", encoded)
 	}
@@ -47,8 +49,12 @@ func TestConnReadResponse(t *testing.T) {
 		t.Fatalf("read response: %v", err)
 	}
 	defer core.ReleaseResponse(resp)
-	if string(resp.Body) != "hello" {
-		t.Fatalf("unexpected response body %q", resp.Body)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read response body: %v", err)
+	}
+	if string(body) != "hello" {
+		t.Fatalf("unexpected response body %q", body)
 	}
 }
 
@@ -60,7 +66,7 @@ func TestConnWriteResponse(t *testing.T) {
 	resp := core.AcquireResponse()
 	defer core.ReleaseResponse(resp)
 	resp.Status = core.NewStatus(200)
-	resp.Body = []byte("ok")
+	resp.SetBody(io.NopCloser(bytes.NewReader([]byte("ok"))))
 
 	if err := conn.WriteResponse(resp); err != nil {
 		t.Fatalf("write response: %v", err)
@@ -75,10 +81,11 @@ func TestFormatResponseChunked(t *testing.T) {
 	defer core.ReleaseResponse(resp)
 	resp.Status = core.NewStatus(200)
 	resp.Headers.Set(core.HeaderTransferEncoding, []byte("chunked"))
-	resp.Body = []byte("hello")
+	resp.SetBody(io.NopCloser(bytes.NewReader([]byte("hello"))))
 	resp.Trailers.SetString("x-cache", "hit")
 
-	encoded := FormatResponse(resp, nil)
+	body, _ := resp.ReadAll()
+	encoded := FormatResponse(resp, body, nil)
 	if bytes.Contains(encoded, []byte("Content-Length:")) {
 		t.Fatalf("content-length should be omitted for chunked response: %q", encoded)
 	}
@@ -97,10 +104,11 @@ func TestFormatRequestChunkedWithTrailers(t *testing.T) {
 		t.Fatalf("init request: %v", err)
 	}
 	req.Headers.Set(core.HeaderTransferEncoding, []byte("chunked"))
-	req.Body = []byte("hello")
+	req.SetBody(io.NopCloser(bytes.NewReader([]byte("hello"))))
 	req.Trailers.SetString("x-origin-status", "stale")
 
-	encoded := FormatRequest(req, nil)
+	body, _ := req.ReadAll()
+	encoded := FormatRequest(req, body, nil)
 	if !bytes.Contains(encoded, []byte("Trailer: x-origin-status\r\n")) {
 		t.Fatalf("missing trailer declaration: %q", encoded)
 	}

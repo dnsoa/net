@@ -2,6 +2,7 @@ package http2
 
 import (
 	"bytes"
+	"io"
 	"testing"
 
 	"github.com/dnsoa/net/httpx/core"
@@ -20,7 +21,7 @@ func TestSessionRequestResponseRoundTrip(t *testing.T) {
 		t.Fatalf("init request: %v", err)
 	}
 	req.Headers.SetString("content-type", "application/json")
-	req.Body = append(req.Body, []byte(`{"name":"httpx"}`)...)
+	req.SetBody(io.NopCloser(bytes.NewReader([]byte(`{"name":"httpx"}`))))
 
 	streamID, err := client.WriteRequest(req)
 	if err != nil {
@@ -44,8 +45,12 @@ func TestSessionRequestResponseRoundTrip(t *testing.T) {
 	if string(gotReq.URI.Path) != "/api/items" || string(gotReq.URI.Query) != "id=7" {
 		t.Fatalf("unexpected uri path=%q query=%q", gotReq.URI.Path, gotReq.URI.Query)
 	}
-	if string(gotReq.Body) != `{"name":"httpx"}` {
-		t.Fatalf("unexpected request body %q", gotReq.Body)
+	body, err := io.ReadAll(gotReq.Body)
+	if err != nil {
+		t.Fatalf("read request body: %v", err)
+	}
+	if string(body) != `{"name":"httpx"}` {
+		t.Fatalf("unexpected request body %q", body)
 	}
 
 	resp := core.AcquireResponse()
@@ -53,7 +58,7 @@ func TestSessionRequestResponseRoundTrip(t *testing.T) {
 	resp.Version = core.VersionHTTP2
 	resp.Status = core.NewStatus(200)
 	resp.Headers.SetString("content-type", "application/json")
-	resp.Body = append(resp.Body, []byte(`{"ok":true}`)...)
+	resp.SetBody(io.NopCloser(bytes.NewReader([]byte(`{"ok":true}`))))
 
 	if err := server.WriteResponse(gotStreamID, resp); err != nil {
 		t.Fatalf("write response: %v", err)
@@ -70,8 +75,12 @@ func TestSessionRequestResponseRoundTrip(t *testing.T) {
 	if gotResp.Status.Code != 200 {
 		t.Fatalf("unexpected response status %d", gotResp.Status.Code)
 	}
-	if string(gotResp.Body) != `{"ok":true}` {
-		t.Fatalf("unexpected response body %q", gotResp.Body)
+	respBody, err := io.ReadAll(gotResp.Body)
+	if err != nil {
+		t.Fatalf("read response body: %v", err)
+	}
+	if string(respBody) != `{"ok":true}` {
+		t.Fatalf("unexpected response body %q", respBody)
 	}
 	if got := gotResp.Headers.Get("content-type"); string(got) != "application/json" {
 		t.Fatalf("unexpected content-type %q", got)
@@ -97,8 +106,12 @@ func TestSessionReadRequestHeaderOnly(t *testing.T) {
 		t.Fatalf("read request: %v", err)
 	}
 	defer core.ReleaseRequest(gotReq)
-	if string(gotReq.Body) != "" {
-		t.Fatalf("expected empty body, got %q", gotReq.Body)
+	var body []byte
+	if gotReq.Body != nil {
+		body, _ = io.ReadAll(gotReq.Body)
+	}
+	if string(body) != "" {
+		t.Fatalf("expected empty body, got %q", body)
 	}
 	if gotReq.Method != core.MethodGet {
 		t.Fatalf("unexpected method %v", gotReq.Method)
@@ -122,7 +135,7 @@ func TestSessionRequestResponseTrailersAndSettingsAck(t *testing.T) {
 	if err := req.Init(core.MethodPost, "https://example.com/upload"); err != nil {
 		t.Fatalf("init request: %v", err)
 	}
-	req.Body = append(req.Body, []byte("payload")...)
+	req.SetBody(io.NopCloser(bytes.NewReader([]byte("payload"))))
 	req.Trailers.SetString("x-digest", "abc")
 
 	streamID, err := client.WriteRequest(req)
@@ -154,7 +167,7 @@ func TestSessionRequestResponseTrailersAndSettingsAck(t *testing.T) {
 	defer core.ReleaseResponse(resp)
 	resp.Version = core.VersionHTTP2
 	resp.Status = core.NewStatus(200)
-	resp.Body = append(resp.Body, []byte("ok")...)
+	resp.SetBody(io.NopCloser(bytes.NewReader([]byte("ok"))))
 	resp.Trailers.SetString("x-cache", "hit")
 
 	if err := server.WriteResponse(streamID, resp); err != nil {

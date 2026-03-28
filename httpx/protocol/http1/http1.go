@@ -12,56 +12,82 @@ import (
 type Conn struct {
 	reader         io.Reader
 	writer         io.Writer
-	pool           *core.BytePool
 	readBuf        []byte
+	writeBuf       []byte
 	maxMessageSize int
 	keepAlive      bool
 }
 
 func NewConn(reader io.Reader, writer io.Writer) *Conn {
-	pool := core.DefaultBytePool
 	return &Conn{
 		reader:         reader,
 		writer:         writer,
-		pool:           pool,
-		readBuf:        pool.Get(16 * 1024),
+		readBuf:        make([]byte, 16*1024),
 		maxMessageSize: 100 * 1024 * 1024,
 		keepAlive:      true,
 	}
 }
 
 func (c *Conn) Close() {
-	if c.pool != nil {
-		c.pool.Put(c.readBuf)
-	}
 	c.readBuf = nil
 }
 
-func FormatRequest(req *core.Request, dst []byte) []byte {
+func FormatRequest(req *core.Request, body []byte, dst []byte) []byte {
 	if req.Headers.IsChunked() {
-		return formatChunkedRequest(req, dst)
+		return formatChunkedRequest(req, body, dst)
 	}
-	ensureRequestContentLength(req)
-	return req.Serialize(dst)
+	ensureRequestContentLength(req, len(body))
+	return formatRequestHead(req, dst, body)
 }
 
-func FormatResponse(resp *core.Response, dst []byte) []byte {
+func FormatResponse(resp *core.Response, body []byte, dst []byte) []byte {
 	if resp.Headers.IsChunked() {
-		return formatChunkedResponse(resp, dst)
+		return formatChunkedResponse(resp, body, dst)
 	}
-	ensureResponseContentLength(resp)
-	return resp.Serialize(dst)
+	ensureResponseContentLength(resp, len(body))
+	return formatResponseHead(resp, dst, body)
+}
+
+func formatRequestHead(req *core.Request, dst []byte, body []byte) []byte {
+	dst = append(dst, req.Method.String()...)
+	dst = append(dst, ' ')
+	dst = req.URI.RequestTarget(dst)
+	dst = append(dst, ' ')
+	dst = append(dst, req.Version.String()...)
+	dst = append(dst, '\r', '\n')
+	dst = req.Headers.Serialize(dst)
+	dst = append(dst, '\r', '\n')
+	dst = append(dst, body...)
+	return dst
+}
+
+func formatResponseHead(resp *core.Response, dst []byte, body []byte) []byte {
+	dst = append(dst, resp.Version.String()...)
+	dst = append(dst, ' ')
+	dst = core.AppendInt(dst, resp.Status.Code)
+	dst = append(dst, ' ')
+	dst = append(dst, resp.Status.Phrase()...)
+	dst = append(dst, '\r', '\n')
+	dst = resp.Headers.Serialize(dst)
+	dst = append(dst, '\r', '\n')
+	dst = append(dst, body...)
+	return dst
 }
 
 func (c *Conn) WriteRequest(req *core.Request) error {
 	if c.writer == nil {
 		return errors.New("http1 writer is nil")
 	}
-	buf := c.pool.GetEmpty(512 + len(req.Body))
-	defer c.pool.Put(buf)
-	buf = FormatRequest(req, buf)
+	body, err := req.ReadAll()
+	if err != nil {
+		return err
+	}
 	c.keepAlive = req.Headers.IsKeepAlive(req.Version)
-	_, err := c.writer.Write(buf)
+	if cap(c.writeBuf) < 512+len(body) {
+		c.writeBuf = make([]byte, 0, 512+len(body))
+	}
+	c.writeBuf = FormatRequest(req, body, c.writeBuf[:0])
+	_, err = c.writer.Write(c.writeBuf)
 	return err
 }
 
@@ -69,11 +95,16 @@ func (c *Conn) WriteResponse(resp *core.Response) error {
 	if c.writer == nil {
 		return errors.New("http1 writer is nil")
 	}
-	buf := c.pool.GetEmpty(512 + len(resp.Body))
-	defer c.pool.Put(buf)
-	buf = FormatResponse(resp, buf)
+	body, err := resp.ReadAll()
+	if err != nil {
+		return err
+	}
 	c.keepAlive = resp.Headers.IsKeepAlive(resp.Version)
-	_, err := c.writer.Write(buf)
+	if cap(c.writeBuf) < 512+len(body) {
+		c.writeBuf = make([]byte, 0, 512+len(body))
+	}
+	c.writeBuf = FormatResponse(resp, body, c.writeBuf[:0])
+	_, err = c.writer.Write(c.writeBuf)
 	return err
 }
 
@@ -101,10 +132,6 @@ func (c *Conn) ShouldKeepAlive() bool {
 	return c.keepAlive
 }
 
-// ReadStreamResponse reads only the response headers from the connection.
-// It returns a partially filled Response (Version, Status, Headers populated, Body is nil)
-// and an io.Reader that provides direct access to the remaining body data on the connection.
-// The caller must read the body to completion before returning the connection to the pool.
 func (c *Conn) ReadStreamResponse() (*core.Response, io.Reader, error) {
 	if c.reader == nil {
 		return nil, nil, errors.New("http1 reader is nil")
@@ -112,7 +139,6 @@ func (c *Conn) ReadStreamResponse() (*core.Response, io.Reader, error) {
 
 	p := rootprotocol.AcquireParser(rootprotocol.ParserModeResponse)
 
-	// Read until headers are complete
 	totalRead := 0
 	for !p.HeaderComplete() && !p.Complete() {
 		n, err := c.reader.Read(c.readBuf)
@@ -137,7 +163,6 @@ func (c *Conn) ReadStreamResponse() (*core.Response, io.Reader, error) {
 		}
 	}
 
-	// Build response from headers only
 	resp := core.AcquireResponse()
 	resp.Version = p.Version
 	resp.Status = core.NewStatus(p.StatusCode)
@@ -149,27 +174,21 @@ func (c *Conn) ReadStreamResponse() (*core.Response, io.Reader, error) {
 
 	rootprotocol.ReleaseParser(p)
 
-	// Create a limited reader for body based on content-length or chunked encoding
 	var bodyReader io.Reader = c.reader
 	if contentLength > 0 {
 		bodyReader = io.LimitReader(c.reader, int64(contentLength))
 	}
-	// Note: for chunked encoding, the caller must handle chunk decoding
 
-	_ = isChunked // TODO: add chunked reader support when needed
+	_ = isChunked
 
 	return resp, bodyReader, nil
 }
 
-// WriteResponseHead writes only the HTTP response status line and headers
-// to the connection. It returns an io.Writer that the caller can use
-// to write body data directly.
 func (c *Conn) WriteResponseHead(resp *core.Response) (io.Writer, error) {
 	if c.writer == nil {
 		return nil, errors.New("http1 writer is nil")
 	}
 
-	// Format and write status line + headers only (no body)
 	buf := make([]byte, 0, 512)
 	buf = append(buf, resp.Version.String()...)
 	buf = append(buf, ' ')
@@ -227,27 +246,27 @@ func (c *Conn) readMessage(mode rootprotocol.ParserMode) (any, error) {
 	return p.BuildResponse()
 }
 
-func ensureRequestContentLength(req *core.Request) {
+func ensureRequestContentLength(req *core.Request, bodyLen int) {
 	if req.Headers.Get("Content-Length") != nil || req.Headers.IsChunked() {
 		return
 	}
-	if len(req.Body) == 0 {
+	if bodyLen == 0 {
 		return
 	}
-	req.Headers.Set(core.HeaderContentLength, []byte(strconv.Itoa(len(req.Body))))
+	req.Headers.Set(core.HeaderContentLength, []byte(strconv.Itoa(bodyLen)))
 }
 
-func ensureResponseContentLength(resp *core.Response) {
+func ensureResponseContentLength(resp *core.Response, bodyLen int) {
 	if resp.Headers.Get("Content-Length") != nil || resp.Headers.IsChunked() {
 		return
 	}
 	if !resp.Status.MayHaveBody() {
 		return
 	}
-	resp.Headers.Set(core.HeaderContentLength, []byte(strconv.Itoa(len(resp.Body))))
+	resp.Headers.Set(core.HeaderContentLength, []byte(strconv.Itoa(bodyLen)))
 }
 
-func formatChunkedRequest(req *core.Request, dst []byte) []byte {
+func formatChunkedRequest(req *core.Request, body []byte, dst []byte) []byte {
 	req.Headers.RemoveAll(core.HeaderContentLength)
 	ensureTrailerDeclaration(&req.Headers, &req.Trailers)
 	dst = append(dst, req.Method.String()...)
@@ -258,11 +277,11 @@ func formatChunkedRequest(req *core.Request, dst []byte) []byte {
 	dst = append(dst, '\r', '\n')
 	dst = req.Headers.Serialize(dst)
 	dst = append(dst, '\r', '\n')
-	dst = appendChunkedBody(dst, req.Body, &req.Trailers)
+	dst = appendChunkedBody(dst, body, &req.Trailers)
 	return dst
 }
 
-func formatChunkedResponse(resp *core.Response, dst []byte) []byte {
+func formatChunkedResponse(resp *core.Response, body []byte, dst []byte) []byte {
 	resp.Headers.RemoveAll(core.HeaderContentLength)
 	ensureTrailerDeclaration(&resp.Headers, &resp.Trailers)
 	dst = append(dst, resp.Version.String()...)
@@ -273,7 +292,7 @@ func formatChunkedResponse(resp *core.Response, dst []byte) []byte {
 	dst = append(dst, '\r', '\n')
 	dst = resp.Headers.Serialize(dst)
 	dst = append(dst, '\r', '\n')
-	dst = appendChunkedBody(dst, resp.Body, &resp.Trailers)
+	dst = appendChunkedBody(dst, body, &resp.Trailers)
 	return dst
 }
 

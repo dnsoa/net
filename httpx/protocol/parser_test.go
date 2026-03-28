@@ -1,6 +1,7 @@
 package protocol
 
 import (
+	"io"
 	"testing"
 
 	"github.com/dnsoa/net/httpx/core"
@@ -29,8 +30,12 @@ func TestParserRequestIncremental(t *testing.T) {
 	if string(req.URI.Path) != "/search" {
 		t.Fatalf("unexpected path %q", req.URI.Path)
 	}
-	if string(req.Body) != "hello" {
-		t.Fatalf("unexpected body %q", req.Body)
+	body, err := io.ReadAll(req.Body)
+	if err != nil {
+		t.Fatalf("read request body: %v", err)
+	}
+	if string(body) != "hello" {
+		t.Fatalf("unexpected body %q", body)
 	}
 }
 
@@ -49,7 +54,11 @@ func TestParserResponseChunked(t *testing.T) {
 		t.Fatalf("build response: %v", err)
 	}
 	defer core.ReleaseResponse(resp)
-	if string(resp.Body) != "hello" {
-		t.Fatalf("unexpected body %q", resp.Body)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read response body: %v", err)
+	}
+	if string(body) != "hello" {
+		t.Fatalf("unexpected body %q", body)
 	}
 }

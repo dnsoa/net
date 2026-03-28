@@ -11,6 +11,10 @@ import (
 	protohttp3 "github.com/dnsoa/net/httpx/protocol/http3"
 )
 
+func nopCloser(b []byte) io.ReadCloser {
+	return io.NopCloser(bytes.NewReader(b))
+}
+
 // ============================================================================
 // HTTP/1 Benchmarks - Request Write/Read
 // ============================================================================
@@ -43,7 +47,7 @@ func BenchmarkHTTP1RequestWrite_POST(b *testing.B) {
 	defer core.ReleaseRequest(req)
 	req.Init(core.MethodPost, "https://example.com/api/users")
 	req.Headers.SetString("Content-Type", "application/json")
-	req.SetBody([]byte(`{"name":"John Doe","email":"john@example.com"}`))
+	req.SetBody(nopCloser([]byte(`{"name":"John Doe","email":"john@example.com"}`)))
 
 	var buf bytes.Buffer
 	conn := protohttp1.NewConn(nil, &buf)
@@ -65,7 +69,7 @@ func BenchmarkHTTP1RequestWrite_Chunked(b *testing.B) {
 	defer core.ReleaseRequest(req)
 	req.Init(core.MethodPost, "https://example.com/upload")
 	req.Headers.Set(core.HeaderTransferEncoding, []byte("chunked"))
-	req.Body = make([]byte, 16384) // 16KB body
+	req.Body = nopCloser(make([]byte, 16384)) // 16KB body
 
 	var buf bytes.Buffer
 	conn := protohttp1.NewConn(nil, &buf)
@@ -136,7 +140,7 @@ func BenchmarkHTTP1ResponseWrite_OK(b *testing.B) {
 	defer core.ReleaseResponse(resp)
 	resp.Status = core.NewStatus(200)
 	resp.Headers.SetString("Content-Type", "application/json")
-	resp.SetBody([]byte(`{"status":"ok","data":[]}`))
+	resp.SetBody(nopCloser([]byte(`{"status":"ok","data":[]}`)))
 
 	var buf bytes.Buffer
 	conn := protohttp1.NewConn(nil, &buf)
@@ -158,7 +162,7 @@ func BenchmarkHTTP1ResponseWrite_Chunked(b *testing.B) {
 	defer core.ReleaseResponse(resp)
 	resp.Status = core.NewStatus(200)
 	resp.Headers.Set(core.HeaderTransferEncoding, []byte("chunked"))
-	resp.Body = make([]byte, 32768) // 32KB body
+	resp.Body = nopCloser(make([]byte, 32768)) // 32KB body
 
 	var buf bytes.Buffer
 	conn := protohttp1.NewConn(nil, &buf)
@@ -239,7 +243,7 @@ func BenchmarkHTTP2RequestWrite(b *testing.B) {
 	req.Init(core.MethodPost, "https://example.com/api/users")
 	req.Headers.SetString("content-type", "application/json")
 	req.Headers.SetString("authorization", "Bearer token123")
-	req.SetBody([]byte(`{"name":"Test User"}`))
+	req.SetBody(nopCloser([]byte(`{"name":"Test User"}`)))
 
 	b.ResetTimer()
 	b.ReportAllocs()
@@ -277,7 +281,7 @@ func BenchmarkHTTP2ResponseWrite(b *testing.B) {
 	defer core.ReleaseResponse(resp)
 	resp.Status = core.NewStatus(200)
 	resp.Headers.SetString("content-type", "application/json")
-	resp.SetBody([]byte(`{"status":"ok","id":123}`))
+	resp.SetBody(nopCloser([]byte(`{"status":"ok","id":123}`)))
 
 	b.ResetTimer()
 	b.ReportAllocs()
@@ -353,7 +357,7 @@ func BenchmarkHTTP3RequestEncode(b *testing.B) {
 	req.Headers.SetString("content-type", "application/json")
 	req.Headers.SetString("authorization", "Bearer token123abc")
 	req.Headers.SetString("x-request-id", "req-123-456")
-	req.SetBody([]byte(`{"data":"test"}`))
+	req.SetBody(nopCloser([]byte(`{"data":"test"}`)))
 
 	b.ResetTimer()
 	b.ReportAllocs()
@@ -398,7 +402,7 @@ func BenchmarkHTTP3ResponseEncode(b *testing.B) {
 	resp.Status = core.NewStatus(200)
 	resp.Headers.SetString("content-type", "application/json")
 	resp.Headers.SetString("x-cache-status", "HIT")
-	resp.SetBody([]byte(`{"users":[]}`))
+	resp.SetBody(nopCloser([]byte(`{"users":[]}`)))
 
 	b.ResetTimer()
 	b.ReportAllocs()
@@ -494,7 +498,7 @@ func BenchmarkCompareResponseEncoding_HTTP1(b *testing.B) {
 	defer core.ReleaseResponse(resp)
 	resp.Status = core.NewStatus(200)
 	resp.Headers.SetString("Content-Type", "application/json")
-	resp.SetBody([]byte(`{"result":"success"}`))
+	resp.SetBody(nopCloser([]byte(`{"result":"success"}`)))
 
 	var buf bytes.Buffer
 	conn := protohttp1.NewConn(nil, &buf)
@@ -513,7 +517,7 @@ func BenchmarkCompareResponseEncoding_HTTP2(b *testing.B) {
 	defer core.ReleaseResponse(resp)
 	resp.Status = core.NewStatus(200)
 	resp.Headers.SetString("content-type", "application/json")
-	resp.SetBody([]byte(`{"result":"success"}`))
+	resp.SetBody(nopCloser([]byte(`{"result":"success"}`)))
 
 	var writer mockWriter
 	session := protohttp2.NewServerSession(&readerStub{}, &writer)
@@ -533,7 +537,7 @@ func BenchmarkCompareResponseEncoding_HTTP3(b *testing.B) {
 	defer core.ReleaseResponse(resp)
 	resp.Status = core.NewStatus(200)
 	resp.Headers.SetString("content-type", "application/json")
-	resp.SetBody([]byte(`{"result":"success"}`))
+	resp.SetBody(nopCloser([]byte(`{"result":"success"}`)))
 
 	b.ResetTimer()
 	b.ReportAllocs()

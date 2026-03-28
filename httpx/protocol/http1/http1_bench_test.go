@@ -2,10 +2,15 @@ package http1
 
 import (
 	"bytes"
+	"io"
 	"testing"
 
 	"github.com/dnsoa/net/httpx/core"
 )
+
+func nopCloser(b []byte) io.ReadCloser {
+	return io.NopCloser(bytes.NewReader(b))
+}
 
 // Benchmark formatting a simple GET request
 func BenchmarkFormatRequestSimple(b *testing.B) {
@@ -16,7 +21,7 @@ func BenchmarkFormatRequestSimple(b *testing.B) {
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
 		buf := make([]byte, 0, 256)
-		_ = FormatRequest(req, buf)
+		_ = FormatRequest(req, nil, buf)
 	}
 }
 
@@ -25,12 +30,12 @@ func BenchmarkFormatRequestWithBody(b *testing.B) {
 	req := core.AcquireRequest()
 	defer core.ReleaseRequest(req)
 	req.Init(core.MethodPost, "https://example.com/api")
-	req.SetBody([]byte(`{"name":"test","value":"data"}`))
+	req.SetBody(nopCloser([]byte(`{"name":"test","value":"data"}`)))
 	b.ResetTimer()
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
 		buf := make([]byte, 0, 512)
-		_ = FormatRequest(req, buf)
+		_ = FormatRequest(req, nil, buf)
 	}
 }
 
@@ -40,12 +45,12 @@ func BenchmarkFormatRequestChunked(b *testing.B) {
 	defer core.ReleaseRequest(req)
 	req.Init(core.MethodPost, "https://example.com/upload")
 	req.Headers.Set(core.HeaderTransferEncoding, []byte("chunked"))
-	req.Body = make([]byte, 8192) // 8KB body
+	req.Body = nopCloser(make([]byte, 8192)) // 8KB body
 	b.ResetTimer()
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
 		buf := make([]byte, 0, 16384)
-		_ = FormatRequest(req, buf)
+		_ = FormatRequest(req, buf, nil)
 	}
 }
 
@@ -54,12 +59,12 @@ func BenchmarkFormatResponseSimple(b *testing.B) {
 	resp := core.AcquireResponse()
 	defer core.ReleaseResponse(resp)
 	resp.Status = core.NewStatus(200)
-	resp.SetBody([]byte("OK"))
+	resp.SetBody(nopCloser([]byte("OK")))
 	b.ResetTimer()
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
 		buf := make([]byte, 0, 256)
-		_ = FormatResponse(resp, buf)
+		_ = FormatResponse(resp, buf, nil)
 	}
 }
 
@@ -73,7 +78,7 @@ func BenchmarkFormatResponseJSON(b *testing.B) {
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
 		buf := make([]byte, 0, 512)
-		_ = FormatResponse(resp, buf)
+		_ = FormatResponse(resp, nil, buf)
 	}
 }
 
@@ -132,7 +137,7 @@ func BenchmarkConnWriteResponse(b *testing.B) {
 	resp := core.AcquireResponse()
 	defer core.ReleaseResponse(resp)
 	resp.Status = core.NewStatus(200)
-	resp.SetBody([]byte(`{"result":"success"}`))
+	resp.SetBody(nopCloser([]byte(`{"result":"success"}`)))
 	b.ResetTimer()
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {

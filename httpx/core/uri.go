@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"errors"
 	"strconv"
+
+	"github.com/dnsoa/go/allocator"
 )
 
 type URI struct {
@@ -16,29 +18,63 @@ type URI struct {
 	Fragment []byte
 	Port     uint16
 	HasPort  bool
-	pool     *BytePool
+	alloc    *allocator.Allocator
+	rawBuf   *allocator.Buffer
+}
+
+func (u *URI) SetAllocator(alloc *allocator.Allocator) {
+	u.alloc = alloc
 }
 
 func (u *URI) Reset() {
-	pool := u.pool
-	if pool == nil {
-		pool = DefaultBytePool
+	if u.rawBuf != nil && u.alloc != nil {
+		u.alloc.Put(u.rawBuf)
 	}
-	pool.Put(u.Raw)
-	*u = URI{pool: pool, Path: []byte("/")}
+	*u = URI{Path: []byte("/")}
 }
 
 func (u *URI) ParseString(raw string) error {
-	owned := DefaultBytePool.GetEmpty(len(raw))
-	owned = append(owned, raw...)
-	return u.ParseOwned(owned)
+	rawBytes := []byte(raw)
+	if u.alloc != nil {
+		buf := u.alloc.Get(len(rawBytes))
+		copy(*buf, rawBytes)
+		return u.parseFromBuffer(buf)
+	}
+	owned := make([]byte, len(rawBytes))
+	copy(owned, rawBytes)
+	return u.parseFromBytes(owned)
 }
 
 func (u *URI) ParseOwned(raw []byte) error {
-	if u.pool == nil {
-		u.pool = DefaultBytePool
+	if u.alloc != nil {
+		buf := u.alloc.Get(len(raw))
+		copy(*buf, raw)
+		return u.parseFromBuffer(buf)
 	}
-	u.pool.Put(u.Raw)
+	owned := make([]byte, len(raw))
+	copy(owned, raw)
+	return u.parseFromBytes(owned)
+}
+
+func (u *URI) parseFromBuffer(buf *allocator.Buffer) error {
+	if u.rawBuf != nil && u.alloc != nil {
+		u.alloc.Put(u.rawBuf)
+	}
+	u.rawBuf = buf
+	u.parse(*buf)
+	return nil
+}
+
+func (u *URI) parseFromBytes(raw []byte) error {
+	if u.rawBuf != nil && u.alloc != nil {
+		u.alloc.Put(u.rawBuf)
+		u.rawBuf = nil
+	}
+	u.parse(raw)
+	return nil
+}
+
+func (u *URI) parse(raw []byte) {
 	u.Raw = raw
 	u.Scheme = nil
 	u.UserInfo = nil
@@ -89,7 +125,6 @@ func (u *URI) ParseOwned(raw []byte) error {
 	if len(u.Path) == 0 {
 		u.Path = []byte("/")
 	}
-	return nil
 }
 
 func (u URI) EffectivePort() uint16 {

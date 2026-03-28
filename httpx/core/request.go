@@ -1,26 +1,30 @@
 package core
 
-import "encoding/json"
+import (
+	"io"
+
+	"github.com/dnsoa/go/allocator"
+	gosync "github.com/dnsoa/go/sync"
+)
 
 type Request struct {
-	Method       Method
-	Version      Version
-	URI          URI
-	Headers      Headers
-	Trailers     Headers
-	Body         []byte
-	bodyExternal bool
-	pool         *BytePool
+	Method        Method
+	Version       Version
+	URI           URI
+	Headers       Headers
+	Trailers      Headers
+	Body          io.ReadCloser
+	ContentLength int64
+	alloc         *allocator.Allocator
 }
 
-var requestPool = SyncPool[*Request]{new: func() *Request {
+var requestPool = gosync.NewPool(func() *Request {
 	return &Request{
 		Version:  VersionHTTP11,
 		Headers:  NewHeaders(),
 		Trailers: NewHeaders(),
-		pool:     DefaultBytePool,
 	}
-}}
+})
 
 func AcquireRequest() *Request {
 	req := requestPool.Get()
@@ -32,26 +36,39 @@ func ReleaseRequest(req *Request) {
 	if req == nil {
 		return
 	}
-	req.Reset()
 	requestPool.Put(req)
 }
 
-func (r *Request) Reset() {
-	pool := r.pool
-	if pool == nil {
-		pool = DefaultBytePool
+func (r *Request) Host() []byte {
+	if len(r.URI.Host) > 0 {
+		return r.URI.Host
 	}
+	return r.Headers.Get("Host")
+}
+
+func (r *Request) SetAllocator(alloc *allocator.Allocator) {
+	r.alloc = alloc
+	r.URI.SetAllocator(alloc)
+	r.Headers.SetAllocator(alloc)
+	r.Trailers.SetAllocator(alloc)
+}
+
+func (r *Request) Reset() {
+	alloc := r.alloc
 	r.Headers.Reset()
 	r.Trailers.Reset()
 	r.URI.Reset()
-	if !r.bodyExternal {
-		pool.Put(r.Body)
+	if r.Body != nil {
+		r.Body.Close()
+		r.Body = nil
 	}
 	*r = Request{
 		Version:  VersionHTTP11,
 		Headers:  NewHeaders(),
 		Trailers: NewHeaders(),
-		pool:     pool,
+	}
+	if alloc != nil {
+		r.SetAllocator(alloc)
 	}
 }
 
@@ -67,45 +84,19 @@ func (r *Request) Init(method Method, rawURL string) error {
 	return nil
 }
 
-func (r *Request) SetBody(body []byte) {
-	if !r.bodyExternal {
-		r.pool.Put(r.Body)
-	}
-	owned := r.pool.GetEmpty(len(body))
-	owned = append(owned, body...)
-	r.Body = owned
-	r.bodyExternal = false
-	r.Headers.Set(HeaderContentLength, AppendInt(nil, len(body)))
-}
-
-func (r *Request) SetOwnedBody(body []byte) {
-	if !r.bodyExternal {
-		r.pool.Put(r.Body)
+// SetBody sets the request body. The caller is responsible for setting
+// ContentLength and Content-Length header when the size is known.
+func (r *Request) SetBody(body io.ReadCloser) {
+	if r.Body != nil {
+		r.Body.Close()
 	}
 	r.Body = body
-	r.bodyExternal = false
-	r.Headers.Set(HeaderContentLength, AppendInt(nil, len(body)))
 }
 
-func (r *Request) SetJSONBody(v any) error {
-	encoded, err := json.Marshal(v)
-	if err != nil {
-		return err
+func (r *Request) ReadAll() ([]byte, error) {
+	if r.Body == nil {
+		return nil, nil
 	}
-	r.Headers.Set(HeaderContentType, []byte("application/json"))
-	r.SetBody(encoded)
-	return nil
-}
-
-func (r *Request) Serialize(dst []byte) []byte {
-	dst = append(dst, r.Method.String()...)
-	dst = append(dst, ' ')
-	dst = r.URI.RequestTarget(dst)
-	dst = append(dst, ' ')
-	dst = append(dst, r.Version.String()...)
-	dst = append(dst, '\r', '\n')
-	dst = r.Headers.Serialize(dst)
-	dst = append(dst, '\r', '\n')
-	dst = append(dst, r.Body...)
-	return dst
+	defer r.Body.Close()
+	return io.ReadAll(r.Body)
 }

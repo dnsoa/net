@@ -1,6 +1,7 @@
 package http3
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -423,8 +424,13 @@ func (s *Session) WriteRequest(w io.Writer, req *core.Request) error {
 	if err := writeFrame(w, FrameHeaders, headersBlock); err != nil {
 		return err
 	}
-	if len(req.Body) > 0 {
-		if err := writeFrame(w, FrameData, req.Body); err != nil {
+	var body []byte
+	if req.Body != nil {
+		body, _ = io.ReadAll(req.Body)
+		req.Body.Close()
+	}
+	if len(body) > 0 {
+		if err := writeFrame(w, FrameData, body); err != nil {
 			return err
 		}
 	}
@@ -462,8 +468,13 @@ func (s *Session) WriteResponse(w io.Writer, resp *core.Response) error {
 	if err := writeFrame(w, FrameHeaders, headersBlock); err != nil {
 		return err
 	}
-	if len(resp.Body) > 0 && resp.Status.MayHaveBody() {
-		if err := writeFrame(w, FrameData, resp.Body); err != nil {
+	var body []byte
+	if resp.Body != nil {
+		body, _ = io.ReadAll(resp.Body)
+		resp.Body.Close()
+	}
+	if len(body) > 0 && resp.Status.MayHaveBody() {
+		if err := writeFrame(w, FrameData, body); err != nil {
 			return err
 		}
 	}
@@ -583,10 +594,13 @@ func (s *Session) readRequestOrResponse(r io.Reader, isRequest bool) (any, error
 		if err != nil {
 			return nil, err
 		}
+		var bodyData []byte
 		for {
 			frame, err := readNextFrame(r)
 			if err != nil {
 				if errors.Is(err, io.EOF) {
+					req.Body = io.NopCloser(bytes.NewReader(bodyData))
+					req.ContentLength = int64(len(bodyData))
 					return req, nil
 				}
 				core.ReleaseRequest(req)
@@ -594,7 +608,7 @@ func (s *Session) readRequestOrResponse(r io.Reader, isRequest bool) (any, error
 			}
 			switch FrameType(frame.Header.Type) {
 			case FrameData:
-				req.Body = appendBody(req.Body, frame.Payload)
+				bodyData = appendBody(bodyData, frame.Payload)
 			case FrameHeaders:
 				trailers, err := s.qpack.DecodeTrailers(frame.Payload)
 				if err != nil {
@@ -609,10 +623,13 @@ func (s *Session) readRequestOrResponse(r io.Reader, isRequest bool) (any, error
 	if err != nil {
 		return nil, err
 	}
+	var bodyData []byte
 	for {
 		frame, err := readNextFrame(r)
 		if err != nil {
 			if errors.Is(err, io.EOF) {
+				resp.Body = io.NopCloser(bytes.NewReader(bodyData))
+				resp.ContentLength = int64(len(bodyData))
 				return resp, nil
 			}
 			core.ReleaseResponse(resp)
@@ -620,7 +637,7 @@ func (s *Session) readRequestOrResponse(r io.Reader, isRequest bool) (any, error
 		}
 		switch FrameType(frame.Header.Type) {
 		case FrameData:
-			resp.Body = appendBody(resp.Body, frame.Payload)
+			bodyData = appendBody(bodyData, frame.Payload)
 		case FrameHeaders:
 			trailers, err := s.qpack.DecodeTrailers(frame.Payload)
 			if err != nil {

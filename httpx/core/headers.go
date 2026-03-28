@@ -3,6 +3,8 @@ package core
 import (
 	"bytes"
 	"strconv"
+
+	"github.com/dnsoa/go/allocator"
 )
 
 var (
@@ -15,26 +17,29 @@ var (
 )
 
 type HeaderEntry struct {
-	Name    []byte
-	Value   []byte
-	backing []byte
+	Name  []byte
+	Value []byte
+	buf   *allocator.Buffer
 }
 
 type Headers struct {
 	entries []HeaderEntry
-	pool    *BytePool
+	alloc   *allocator.Allocator
 }
 
 func NewHeaders() Headers {
-	return Headers{pool: DefaultBytePool}
+	return Headers{}
+}
+
+func (h *Headers) SetAllocator(alloc *allocator.Allocator) {
+	h.alloc = alloc
 }
 
 func (h *Headers) Reset() {
-	if h.pool == nil {
-		h.pool = DefaultBytePool
-	}
 	for i := range h.entries {
-		h.pool.Put(h.entries[i].backing)
+		if h.entries[i].buf != nil && h.alloc != nil {
+			h.alloc.Put(h.entries[i].buf)
+		}
 		h.entries[i] = HeaderEntry{}
 	}
 	h.entries = h.entries[:0]
@@ -49,15 +54,26 @@ func (h *Headers) Entries() []HeaderEntry {
 }
 
 func (h *Headers) Append(name, value []byte) {
-	if h.pool == nil {
-		h.pool = DefaultBytePool
+	totalLen := len(name) + len(value)
+	if h.alloc != nil {
+		buf := h.alloc.Get(totalLen)
+		nLen := len(name)
+		copy((*buf)[:nLen], name)
+		copy((*buf)[nLen:], value)
+		h.entries = append(h.entries, HeaderEntry{
+			Name:  (*buf)[:nLen],
+			Value: (*buf)[nLen:],
+			buf:   buf,
+		})
+	} else {
+		owned := make([]byte, totalLen)
+		copy(owned[:len(name)], name)
+		copy(owned[len(name):], value)
+		h.entries = append(h.entries, HeaderEntry{
+			Name:  owned[:len(name)],
+			Value: owned[len(name):],
+		})
 	}
-	backing := h.pool.GetEmpty(len(name) + len(value))
-	backing = append(backing, name...)
-	entryName := backing[:len(name)]
-	backing = append(backing, value...)
-	entryValue := backing[len(name):]
-	h.entries = append(h.entries, HeaderEntry{Name: entryName, Value: entryValue, backing: backing})
 }
 
 func (h *Headers) AppendString(name, value string) {
@@ -102,7 +118,9 @@ func (h *Headers) RemoveAll(name []byte) {
 	out := h.entries[:0]
 	for _, entry := range h.entries {
 		if bytes.EqualFold(entry.Name, name) {
-			h.pool.Put(entry.backing)
+			if entry.buf != nil && h.alloc != nil {
+				h.alloc.Put(entry.buf)
+			}
 			continue
 		}
 		out = append(out, entry)
@@ -112,6 +130,7 @@ func (h *Headers) RemoveAll(name []byte) {
 
 func (h *Headers) Clone() Headers {
 	clone := NewHeaders()
+	clone.alloc = h.alloc
 	for _, entry := range h.entries {
 		clone.Append(entry.Name, entry.Value)
 	}

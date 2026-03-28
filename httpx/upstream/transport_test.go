@@ -16,6 +16,18 @@ import (
 	protohttp3 "github.com/dnsoa/net/httpx/protocol/http3"
 )
 
+func readBody(t *testing.T, r io.ReadCloser) []byte {
+	t.Helper()
+	if r == nil {
+		return nil
+	}
+	b, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	return b
+}
+
 func TestHTTP1TransportRoundTrip(t *testing.T) {
 	clientConn, serverConn := net.Pipe()
 	defer clientConn.Close()
@@ -38,7 +50,7 @@ func TestHTTP1TransportRoundTrip(t *testing.T) {
 		defer core.ReleaseResponse(resp)
 		resp.Status = core.NewStatus(200)
 		resp.Headers.SetString("x-upstream", "http1")
-		resp.Body = append(resp.Body, []byte("ok-http1")...)
+		resp.SetBody(io.NopCloser(bytes.NewReader([]byte("ok-http1"))))
 		_ = server.WriteResponse(resp)
 	}()
 
@@ -52,8 +64,8 @@ func TestHTTP1TransportRoundTrip(t *testing.T) {
 		t.Fatalf("round trip: %v", err)
 	}
 	defer core.ReleaseResponse(resp)
-	if string(resp.Body) != "ok-http1" {
-		t.Fatalf("unexpected body %q", resp.Body)
+	if body := string(readBody(t, resp.Body)); body != "ok-http1" {
+		t.Fatalf("unexpected body %q", body)
 	}
 	wg.Wait()
 }
@@ -80,7 +92,7 @@ func TestHTTP2TransportRoundTrip(t *testing.T) {
 		resp.Version = core.VersionHTTP2
 		resp.Status = core.NewStatus(206)
 		resp.Headers.SetString("x-upstream", "http2")
-		resp.Body = append(resp.Body, []byte("ok-http2")...)
+		resp.SetBody(io.NopCloser(bytes.NewReader([]byte("ok-http2"))))
 		_ = server.WriteResponse(streamID, resp)
 	}()
 
@@ -98,8 +110,8 @@ func TestHTTP2TransportRoundTrip(t *testing.T) {
 	if resp.Status.Code != 206 {
 		t.Fatalf("unexpected status %d", resp.Status.Code)
 	}
-	if string(resp.Body) != "ok-http2" {
-		t.Fatalf("unexpected body %q", resp.Body)
+	if body := string(readBody(t, resp.Body)); body != "ok-http2" {
+		t.Fatalf("unexpected body %q", body)
 	}
 	wg.Wait()
 }
@@ -208,7 +220,7 @@ func TestHTTP3TransportRoundTrip(t *testing.T) {
 			resp.Version = core.VersionHTTP3
 			resp.Status = core.NewStatus(200)
 			resp.Headers.SetString("x-upstream", "http3")
-			resp.Body = append(resp.Body, []byte("ok-http3")...)
+			resp.SetBody(io.NopCloser(bytes.NewReader([]byte("ok-http3"))))
 			var response bytes.Buffer
 			if err := serverSession.WriteResponse(&response, resp); err != nil {
 				return nil, err
@@ -228,8 +240,8 @@ func TestHTTP3TransportRoundTrip(t *testing.T) {
 		t.Fatalf("round trip: %v", err)
 	}
 	defer core.ReleaseResponse(resp)
-	if string(resp.Body) != "ok-http3" {
-		t.Fatalf("unexpected body %q", resp.Body)
+	if body := string(readBody(t, resp.Body)); body != "ok-http3" {
+		t.Fatalf("unexpected body %q", body)
 	}
 }
 
@@ -283,7 +295,7 @@ func TestHTTP3TransportConcurrentRoundTrip(t *testing.T) {
 		resp.Status = core.NewStatus(200)
 		resp.Headers.SetString("x-upstream", "http3")
 		resp.Headers.SetString("x-request-id", requestID)
-		resp.Body = append(resp.Body, []byte(fmt.Sprintf("ok-http3-%s", requestID))...)
+		resp.SetBody(io.NopCloser(bytes.NewReader([]byte(fmt.Sprintf("ok-http3-%s", requestID)))))
 
 		var response bytes.Buffer
 		if err := serverSession.WriteResponse(&response, resp); err != nil {
@@ -325,8 +337,8 @@ func TestHTTP3TransportConcurrentRoundTrip(t *testing.T) {
 				errCh <- fmt.Errorf("unexpected response header id %q", got)
 				return
 			}
-			if got := string(resp.Body); got != "ok-http3-"+requestID {
-				errCh <- fmt.Errorf("unexpected response body %q", got)
+			if body := string(readBody(t, resp.Body)); body != "ok-http3-"+requestID {
+				errCh <- fmt.Errorf("unexpected response body %q", body)
 				return
 			}
 		}(requestID)

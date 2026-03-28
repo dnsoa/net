@@ -360,7 +360,7 @@ func TestSessionControlAndMessageRoundTrip(t *testing.T) {
 	if err := req.Init(core.MethodPost, "https://origin.example.com/cache/fill?id=1"); err != nil {
 		t.Fatalf("init request: %v", err)
 	}
-	req.Body = append(req.Body, []byte("chunk-a")...)
+	req.SetBody(io.NopCloser(bytes.NewReader([]byte("chunk-a"))))
 	req.Trailers.SetString("x-origin-etag", "abc")
 
 	var requestStream bytes.Buffer
@@ -372,8 +372,12 @@ func TestSessionControlAndMessageRoundTrip(t *testing.T) {
 		t.Fatalf("read request: %v", err)
 	}
 	defer core.ReleaseRequest(decodedReq)
-	if string(decodedReq.Body) != "chunk-a" {
-		t.Fatalf("unexpected request body %q", decodedReq.Body)
+	decodedBody, err := io.ReadAll(decodedReq.Body)
+	if err != nil {
+		t.Fatalf("read decoded request body: %v", err)
+	}
+	if string(decodedBody) != "chunk-a" {
+		t.Fatalf("unexpected request body %q", decodedBody)
 	}
 	if string(decodedReq.Trailers.Get("x-origin-etag")) != "abc" {
 		t.Fatalf("unexpected request trailer %q", decodedReq.Trailers.Get("x-origin-etag"))
@@ -384,7 +388,7 @@ func TestSessionControlAndMessageRoundTrip(t *testing.T) {
 	resp.Version = core.VersionHTTP3
 	resp.Status = core.NewStatus(200)
 	resp.Headers.SetString("content-type", "application/octet-stream")
-	resp.Body = append(resp.Body, []byte("payload")...)
+	resp.SetBody(io.NopCloser(bytes.NewReader([]byte("payload"))))
 	resp.Trailers.SetString("x-cache", "hit")
 
 	var responseStream bytes.Buffer
@@ -402,8 +406,12 @@ func TestSessionControlAndMessageRoundTrip(t *testing.T) {
 	if string(decodedResp.Trailers.Get("x-cache")) != "hit" {
 		t.Fatalf("unexpected response trailer %q", decodedResp.Trailers.Get("x-cache"))
 	}
-	if string(decodedResp.Body) != "payload" {
-		t.Fatalf("unexpected response body %q", decodedResp.Body)
+	respBody, err := io.ReadAll(decodedResp.Body)
+	if err != nil {
+		t.Fatalf("read decoded response body: %v", err)
+	}
+	if string(respBody) != "payload" {
+		t.Fatalf("unexpected response body %q", respBody)
 	}
 }
 
@@ -521,7 +529,7 @@ func TestTransportRoundTripLifecycleClosesStream(t *testing.T) {
 	defer core.ReleaseResponse(resp)
 	resp.Version = core.VersionHTTP3
 	resp.Status = core.NewStatus(200)
-	resp.Body = append(resp.Body, []byte("ok")...)
+	resp.SetBody(io.NopCloser(bytes.NewReader([]byte("ok"))))
 	var response bytes.Buffer
 	if err := server.WriteResponse(&response, resp); err != nil {
 		t.Fatalf("write response: %v", err)
@@ -545,8 +553,12 @@ func TestTransportRoundTripLifecycleClosesStream(t *testing.T) {
 		t.Fatalf("round trip: %v", err)
 	}
 	defer core.ReleaseResponse(gotResp)
-	if got := string(gotResp.Body); got != "ok" {
-		t.Fatalf("unexpected response body %q", got)
+	gotBody, err := io.ReadAll(gotResp.Body)
+	if err != nil {
+		t.Fatalf("read response body: %v", err)
+	}
+	if string(gotBody) != "ok" {
+		t.Fatalf("unexpected response body %q", gotBody)
 	}
 	if got := stream.closeWriteCalls.Load(); got != 1 {
 		t.Fatalf("unexpected close write calls %d", got)
@@ -666,7 +678,7 @@ func TestTransportRoundTripIntegratesQPACKStreams(t *testing.T) {
 		resp.Status = core.NewStatus(200)
 		resp.Headers.SetString("x-cache-node", "edge-1")
 		resp.Headers.SetString("x-cache-key", string(req.Headers.Get("x-cache-key")))
-		resp.Body = append(resp.Body, []byte("ok")...)
+		resp.SetBody(io.NopCloser(bytes.NewReader([]byte("ok"))))
 
 		var response bytes.Buffer
 		if err := server.WriteResponse(&response, resp); err != nil {

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"strconv"
+	"sync"
 
 	"github.com/dnsoa/net/httpx/core"
 )
@@ -39,27 +40,27 @@ type Parser struct {
 	Headers         core.Headers
 	body            []byte
 	line            []byte
-	pool            *core.BytePool
 	contentLength   int
 	chunked         bool
 	currentChunkLen int
 	bodyRead        int
 	Err             error
 	maxHeaderBytes  int
-	bodyWriter     io.Writer // 流式body输出目标
+	bodyWriter      io.Writer
 }
 
-var parserPool = core.NewSyncPool(func() *Parser {
-	return &Parser{
-		Headers:        core.NewHeaders(),
-		pool:           core.DefaultBytePool,
-		maxHeaderBytes: 8192,
-		state:          parserStateStartLine,
-	}
-})
+var parserPool = sync.Pool{
+	New: func() any {
+		return &Parser{
+			Headers:        core.NewHeaders(),
+			maxHeaderBytes: 8192,
+			state:          parserStateStartLine,
+		}
+	},
+}
 
 func AcquireParser(mode ParserMode) *Parser {
-	p := parserPool.Get()
+	p := parserPool.Get().(*Parser)
 	p.Reset(mode)
 	return p
 }
@@ -73,20 +74,12 @@ func ReleaseParser(p *Parser) {
 }
 
 func (p *Parser) Reset(mode ParserMode) {
-	pool := p.pool
-	if pool == nil {
-		pool = core.DefaultBytePool
-	}
-	pool.Put(p.target)
-	pool.Put(p.body)
-	pool.Put(p.line)
 	p.Headers.Reset()
 	*p = Parser{
 		Mode:           mode,
 		state:          parserStateStartLine,
 		Version:        core.VersionHTTP11,
-		Headers:        core.NewHeaders(),
-		pool:           pool,
+		Headers:        p.Headers,
 		maxHeaderBytes: 8192,
 	}
 }
@@ -95,24 +88,18 @@ func (p *Parser) Complete() bool {
 	return p.state == parserStateComplete
 }
 
-// HeaderComplete returns true when headers have been fully parsed
-// and the parser is ready to read body data.
 func (p *Parser) HeaderComplete() bool {
 	return p.state >= parserStateBody
 }
 
-// SetBodyWriter sets a writer to receive body data as it is parsed,
-// instead of buffering it internally. Call before Feed.
 func (p *Parser) SetBodyWriter(w io.Writer) {
 	p.bodyWriter = w
 }
 
-// ContentLength returns the declared content length, or 0 if not set.
 func (p *Parser) ContentLength() int {
 	return p.contentLength
 }
 
-// IsChunked returns whether the message uses chunked transfer encoding.
 func (p *Parser) IsChunked() bool {
 	return p.chunked
 }
@@ -153,7 +140,6 @@ func (p *Parser) Feed(data []byte) (int, error) {
 		case parserStateBody:
 			need := p.contentLength - p.bodyRead
 			if p.contentLength == 0 {
-				// Response mode with no Content-Length: read until EOF
 				if p.bodyWriter != nil {
 					if len(data[consumed:]) > 0 {
 						p.bodyWriter.Write(data[consumed:])
@@ -174,7 +160,6 @@ func (p *Parser) Feed(data []byte) (int, error) {
 			if p.bodyWriter != nil {
 				p.bodyWriter.Write(data[consumed : consumed+need])
 			} else {
-				p.body = p.pool.Grow(p.body, need)
 				p.body = append(p.body, data[consumed:consumed+need]...)
 			}
 			consumed += need
@@ -213,7 +198,6 @@ func (p *Parser) Feed(data []byte) (int, error) {
 			if p.bodyWriter != nil {
 				p.bodyWriter.Write(data[consumed : consumed+need])
 			} else {
-				p.body = p.pool.Grow(p.body, need)
 				p.body = append(p.body, data[consumed:consumed+need]...)
 			}
 			consumed += need
@@ -255,8 +239,10 @@ func (p *Parser) BuildRequest() (*core.Request, error) {
 		return nil, err
 	}
 	p.target = nil
-	req.Body = p.body
+	body := p.body
 	p.body = nil
+	req.Body = io.NopCloser(bytes.NewReader(body))
+	req.ContentLength = int64(len(body))
 	return req, nil
 }
 
@@ -269,8 +255,10 @@ func (p *Parser) BuildResponse() (*core.Response, error) {
 	resp.Status = core.NewStatus(p.StatusCode)
 	resp.Headers = p.Headers
 	p.Headers = core.NewHeaders()
-	resp.Body = p.body
+	body := p.body
 	p.body = nil
+	resp.Body = io.NopCloser(bytes.NewReader(body))
+	resp.ContentLength = int64(len(body))
 	return resp, nil
 }
 
@@ -291,8 +279,8 @@ func (p *Parser) parseStartLine(line []byte) error {
 			return errors.New("invalid http version")
 		}
 		p.Version = version
-		p.target = p.pool.GetEmpty(len(parts[1]))
-		p.target = append(p.target, parts[1]...)
+		p.target = make([]byte, len(parts[1]))
+		copy(p.target, parts[1])
 		return nil
 	}
 	version, ok := core.ParseVersionBytes(parts[0])
@@ -347,7 +335,6 @@ func (p *Parser) readLine(data []byte) (int, []byte, bool, error) {
 		if len(p.line) == 0 {
 			return idx + 2, data[:idx], true, nil
 		}
-		p.line = p.pool.Grow(p.line, idx)
 		p.line = append(p.line, data[:idx]...)
 		line := p.line
 		p.line = nil
@@ -356,7 +343,6 @@ func (p *Parser) readLine(data []byte) (int, []byte, bool, error) {
 	if len(p.line)+len(data) > p.maxHeaderBytes {
 		return len(data), nil, false, errors.New("line too large")
 	}
-	p.line = p.pool.Grow(p.line, len(data))
 	p.line = append(p.line, data...)
 	return len(data), nil, false, nil
 }
