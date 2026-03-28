@@ -3,6 +3,7 @@ package protocol
 import (
 	"bytes"
 	"errors"
+	"io"
 	"strconv"
 
 	"github.com/dnsoa/net/httpx/core"
@@ -45,6 +46,7 @@ type Parser struct {
 	bodyRead        int
 	Err             error
 	maxHeaderBytes  int
+	bodyWriter     io.Writer // 流式body输出目标
 }
 
 var parserPool = core.NewSyncPool(func() *Parser {
@@ -93,6 +95,28 @@ func (p *Parser) Complete() bool {
 	return p.state == parserStateComplete
 }
 
+// HeaderComplete returns true when headers have been fully parsed
+// and the parser is ready to read body data.
+func (p *Parser) HeaderComplete() bool {
+	return p.state >= parserStateBody
+}
+
+// SetBodyWriter sets a writer to receive body data as it is parsed,
+// instead of buffering it internally. Call before Feed.
+func (p *Parser) SetBodyWriter(w io.Writer) {
+	p.bodyWriter = w
+}
+
+// ContentLength returns the declared content length, or 0 if not set.
+func (p *Parser) ContentLength() int {
+	return p.contentLength
+}
+
+// IsChunked returns whether the message uses chunked transfer encoding.
+func (p *Parser) IsChunked() bool {
+	return p.chunked
+}
+
 func (p *Parser) Feed(data []byte) (int, error) {
 	consumed := 0
 	for consumed < len(data) && p.state != parserStateComplete && p.state != parserStateError {
@@ -129,7 +153,14 @@ func (p *Parser) Feed(data []byte) (int, error) {
 		case parserStateBody:
 			need := p.contentLength - p.bodyRead
 			if p.contentLength == 0 {
-				p.body = append(p.body, data[consumed:]...)
+				// Response mode with no Content-Length: read until EOF
+				if p.bodyWriter != nil {
+					if len(data[consumed:]) > 0 {
+						p.bodyWriter.Write(data[consumed:])
+					}
+				} else {
+					p.body = append(p.body, data[consumed:]...)
+				}
 				consumed = len(data)
 				return consumed, nil
 			}
@@ -140,8 +171,12 @@ func (p *Parser) Feed(data []byte) (int, error) {
 			if need > len(data)-consumed {
 				need = len(data) - consumed
 			}
-			p.body = p.pool.Grow(p.body, need)
-			p.body = append(p.body, data[consumed:consumed+need]...)
+			if p.bodyWriter != nil {
+				p.bodyWriter.Write(data[consumed : consumed+need])
+			} else {
+				p.body = p.pool.Grow(p.body, need)
+				p.body = append(p.body, data[consumed:consumed+need]...)
+			}
 			consumed += need
 			p.bodyRead += need
 			if p.bodyRead == p.contentLength {
@@ -175,8 +210,12 @@ func (p *Parser) Feed(data []byte) (int, error) {
 			if need > len(data)-consumed {
 				need = len(data) - consumed
 			}
-			p.body = p.pool.Grow(p.body, need)
-			p.body = append(p.body, data[consumed:consumed+need]...)
+			if p.bodyWriter != nil {
+				p.bodyWriter.Write(data[consumed : consumed+need])
+			} else {
+				p.body = p.pool.Grow(p.body, need)
+				p.body = append(p.body, data[consumed:consumed+need]...)
+			}
 			consumed += need
 			p.currentChunkLen -= need
 			if p.currentChunkLen == 0 {

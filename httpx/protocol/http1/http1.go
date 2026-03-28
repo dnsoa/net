@@ -101,6 +101,94 @@ func (c *Conn) ShouldKeepAlive() bool {
 	return c.keepAlive
 }
 
+// ReadStreamResponse reads only the response headers from the connection.
+// It returns a partially filled Response (Version, Status, Headers populated, Body is nil)
+// and an io.Reader that provides direct access to the remaining body data on the connection.
+// The caller must read the body to completion before returning the connection to the pool.
+func (c *Conn) ReadStreamResponse() (*core.Response, io.Reader, error) {
+	if c.reader == nil {
+		return nil, nil, errors.New("http1 reader is nil")
+	}
+
+	p := rootprotocol.AcquireParser(rootprotocol.ParserModeResponse)
+
+	// Read until headers are complete
+	totalRead := 0
+	for !p.HeaderComplete() && !p.Complete() {
+		n, err := c.reader.Read(c.readBuf)
+		if n > 0 {
+			totalRead += n
+			if totalRead > c.maxMessageSize {
+				rootprotocol.ReleaseParser(p)
+				return nil, nil, errors.New("http1 message too large")
+			}
+			if _, feedErr := p.Feed(c.readBuf[:n]); feedErr != nil {
+				rootprotocol.ReleaseParser(p)
+				return nil, nil, feedErr
+			}
+		}
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				p.FinishEOF()
+				break
+			}
+			rootprotocol.ReleaseParser(p)
+			return nil, nil, err
+		}
+	}
+
+	// Build response from headers only
+	resp := core.AcquireResponse()
+	resp.Version = p.Version
+	resp.Status = core.NewStatus(p.StatusCode)
+	resp.Headers = p.Headers
+	c.keepAlive = resp.Headers.IsKeepAlive(resp.Version)
+
+	contentLength := p.ContentLength()
+	isChunked := p.IsChunked()
+
+	rootprotocol.ReleaseParser(p)
+
+	// Create a limited reader for body based on content-length or chunked encoding
+	var bodyReader io.Reader = c.reader
+	if contentLength > 0 {
+		bodyReader = io.LimitReader(c.reader, int64(contentLength))
+	}
+	// Note: for chunked encoding, the caller must handle chunk decoding
+
+	_ = isChunked // TODO: add chunked reader support when needed
+
+	return resp, bodyReader, nil
+}
+
+// WriteResponseHead writes only the HTTP response status line and headers
+// to the connection. It returns an io.Writer that the caller can use
+// to write body data directly.
+func (c *Conn) WriteResponseHead(resp *core.Response) (io.Writer, error) {
+	if c.writer == nil {
+		return nil, errors.New("http1 writer is nil")
+	}
+
+	// Format and write status line + headers only (no body)
+	buf := make([]byte, 0, 512)
+	buf = append(buf, resp.Version.String()...)
+	buf = append(buf, ' ')
+	buf = strconv.AppendInt(buf, int64(resp.Status.Code), 10)
+	buf = append(buf, ' ')
+	buf = append(buf, resp.Status.Phrase()...)
+	buf = append(buf, '\r', '\n')
+	buf = resp.Headers.Serialize(buf)
+	buf = append(buf, '\r', '\n')
+
+	c.keepAlive = resp.Headers.IsKeepAlive(resp.Version)
+
+	if _, err := c.writer.Write(buf); err != nil {
+		return nil, err
+	}
+
+	return c.writer, nil
+}
+
 func (c *Conn) readMessage(mode rootprotocol.ParserMode) (any, error) {
 	if c.reader == nil {
 		return nil, errors.New("http1 reader is nil")
