@@ -132,6 +132,65 @@ func TestConnReadResponseKeepAliveFalse(t *testing.T) {
 	}
 }
 
+func TestConnReadStreamResponseChunkedKeepAlive(t *testing.T) {
+	input := bytes.NewBufferString("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nTrailer: x-cache\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\nx-cache: hit\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+	conn := NewConn(input, nil)
+	defer conn.Close()
+
+	resp, bodyReader, err := conn.ReadStreamResponse()
+	if err != nil {
+		t.Fatalf("read stream response: %v", err)
+	}
+	defer core.ReleaseResponse(resp)
+
+	body, err := io.ReadAll(bodyReader)
+	if err != nil {
+		t.Fatalf("read chunked body: %v", err)
+	}
+	if string(body) != "hello world" {
+		t.Fatalf("unexpected chunked body %q", body)
+	}
+	if got := string(resp.Trailers.Get("x-cache")); got != "hit" {
+		t.Fatalf("unexpected trailer value %q", got)
+	}
+
+	nextResp, err := conn.ReadResponse()
+	if err != nil {
+		t.Fatalf("read pipelined response after chunked stream: %v", err)
+	}
+	defer core.ReleaseResponse(nextResp)
+	nextBody, err := io.ReadAll(nextResp.Body)
+	if err != nil {
+		t.Fatalf("read next response body: %v", err)
+	}
+	if string(nextBody) != "ok" {
+		t.Fatalf("unexpected next response body %q", nextBody)
+	}
+}
+
+func TestConnReadStreamResponseChunkedTrailerTooLarge(t *testing.T) {
+	largeValue := bytes.Repeat([]byte("a"), maxTrailerLineBytes+1)
+	input := bytes.NewBuffer(nil)
+	input.WriteString("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\r\na\r\n0\r\n")
+	input.WriteString("x-large: ")
+	input.Write(largeValue)
+	input.WriteString("\r\n\r\n")
+
+	conn := NewConn(input, nil)
+	defer conn.Close()
+
+	resp, bodyReader, err := conn.ReadStreamResponse()
+	if err != nil {
+		t.Fatalf("read stream response: %v", err)
+	}
+	defer core.ReleaseResponse(resp)
+
+	_, err = io.ReadAll(bodyReader)
+	if err == nil {
+		t.Fatal("expected oversized trailer to fail")
+	}
+}
+
 func TestConnReadRequestKeepAliveHTTP10(t *testing.T) {
 	input := bytes.NewBufferString("GET /ping HTTP/1.0\r\nHost: example.com\r\n\r\n")
 	conn := NewConn(input, nil)

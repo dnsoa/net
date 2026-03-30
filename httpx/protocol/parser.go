@@ -1,3 +1,4 @@
+// Package protocol provides HTTP message parsing primitives.
 package protocol
 
 import (
@@ -102,6 +103,15 @@ func (p *Parser) ContentLength() int {
 
 func (p *Parser) IsChunked() bool {
 	return p.chunked
+}
+
+func (p *Parser) DrainBodyBuffer() []byte {
+	if len(p.body) == 0 {
+		return nil
+	}
+	body := append([]byte(nil), p.body...)
+	p.body = nil
+	return body
 }
 
 func (p *Parser) Feed(data []byte) (int, error) {

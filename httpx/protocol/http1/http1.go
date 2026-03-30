@@ -1,18 +1,24 @@
+// Package http1 provides HTTP/1.x encoding and parsing helpers.
 package http1
 
 import (
+	"bytes"
 	"errors"
 	"io"
 	"strconv"
+	"sync"
 
 	"github.com/dnsoa/net/httpx/core"
 	rootprotocol "github.com/dnsoa/net/httpx/protocol"
 )
 
+const maxTrailerLineBytes = 8 * 1024
+
 type Conn struct {
 	reader         io.Reader
 	writer         io.Writer
 	readBuf        []byte
+	pending        []byte
 	writeBuf       []byte
 	maxMessageSize int
 	keepAlive      bool
@@ -30,6 +36,7 @@ func NewConn(reader io.Reader, writer io.Writer) *Conn {
 
 func (c *Conn) Close() {
 	c.readBuf = nil
+	c.pending = nil
 }
 
 func FormatRequest(req *core.Request, body []byte, dst []byte) []byte {
@@ -141,14 +148,19 @@ func (c *Conn) ReadStreamResponse() (*core.Response, io.Reader, error) {
 
 	totalRead := 0
 	for !p.HeaderComplete() && !p.Complete() {
-		n, err := c.reader.Read(c.readBuf)
+		data, err := c.readNextChunk()
+		n := len(data)
 		if n > 0 {
 			totalRead += n
 			if totalRead > c.maxMessageSize {
 				rootprotocol.ReleaseParser(p)
 				return nil, nil, errors.New("http1 message too large")
 			}
-			if _, feedErr := p.Feed(c.readBuf[:n]); feedErr != nil {
+			consumed, feedErr := p.Feed(data)
+			if consumed < len(data) {
+				c.unread(data[consumed:])
+			}
+			if feedErr != nil {
 				rootprotocol.ReleaseParser(p)
 				return nil, nil, feedErr
 			}
@@ -171,17 +183,118 @@ func (c *Conn) ReadStreamResponse() (*core.Response, io.Reader, error) {
 
 	contentLength := p.ContentLength()
 	isChunked := p.IsChunked()
+	bufferedBody := p.DrainBodyBuffer()
+
+	if isChunked {
+		bodyReader := c.newChunkedBodyReader(p, resp, bufferedBody)
+		return resp, bodyReader, nil
+	}
 
 	rootprotocol.ReleaseParser(p)
 
-	var bodyReader io.Reader = c.reader
-	if contentLength > 0 {
-		bodyReader = io.LimitReader(c.reader, int64(contentLength))
+	var bodyReader io.Reader = bytes.NewReader(bufferedBody)
+	if contentLength > len(bufferedBody) {
+		bodyReader = io.MultiReader(bodyReader, io.LimitReader(c.reader, int64(contentLength-len(bufferedBody))))
+	} else if contentLength == 0 {
+		// HTTP/1.x responses without Content-Length or chunked framing are EOF-delimited.
+		bodyReader = io.MultiReader(bodyReader, c.reader)
 	}
 
-	_ = isChunked
-
 	return resp, bodyReader, nil
+}
+
+func (c *Conn) newChunkedBodyReader(p *rootprotocol.Parser, resp *core.Response, bufferedBody []byte) io.Reader {
+	pr, pw := io.Pipe()
+	p.SetBodyWriter(pw)
+	bodyReader := &chunkedBodyReader{
+		reader: pr,
+	}
+	if closer, ok := c.reader.(io.Closer); ok {
+		bodyReader.sourceCloser = closer
+	}
+
+	go func() {
+		defer rootprotocol.ReleaseParser(p)
+		defer bodyReader.markCompleted()
+		for !p.Complete() {
+			data, err := c.readNextChunk()
+			if len(data) > 0 {
+				consumed, feedErr := p.Feed(data)
+				if consumed < len(data) {
+					c.unread(data[consumed:])
+				}
+				if feedErr != nil {
+					_ = pw.CloseWithError(feedErr)
+					return
+				}
+			}
+			if err != nil {
+				if errors.Is(err, io.EOF) {
+					p.FinishEOF()
+					if p.Complete() {
+						break
+					}
+				}
+				_ = pw.CloseWithError(err)
+				return
+			}
+		}
+		if err := c.consumeTrailerSection(&resp.Trailers); err != nil {
+			_ = pw.CloseWithError(err)
+			return
+		}
+		_ = pw.Close()
+	}()
+
+	if len(bufferedBody) == 0 {
+		return bodyReader
+	}
+	bodyReader.prefix = bytes.NewReader(bufferedBody)
+	return bodyReader
+}
+
+type chunkedBodyReader struct {
+	prefix        io.Reader
+	reader        *io.PipeReader
+	sourceCloser  io.Closer
+	completed     bool
+	closeOnce     sync.Once
+	completeMutex sync.Mutex
+}
+
+func (r *chunkedBodyReader) Read(p []byte) (int, error) {
+	if r.prefix != nil {
+		n, err := r.prefix.Read(p)
+		if errors.Is(err, io.EOF) {
+			r.prefix = nil
+			if n > 0 {
+				return n, nil
+			}
+		} else {
+			return n, err
+		}
+	}
+	return r.reader.Read(p)
+}
+
+func (r *chunkedBodyReader) Close() error {
+	var err error
+	r.closeOnce.Do(func() {
+		r.completeMutex.Lock()
+		completed := r.completed
+		r.completeMutex.Unlock()
+		if !completed && r.sourceCloser != nil {
+			_ = r.sourceCloser.Close()
+		}
+		err = r.reader.Close()
+	})
+	return err
+}
+
+func (r *chunkedBodyReader) markCompleted() {
+	r.completeMutex.Lock()
+	r.completed = true
+	r.completeMutex.Unlock()
 }
 
 func (c *Conn) WriteResponseHead(resp *core.Response) (io.Writer, error) {
@@ -217,13 +330,18 @@ func (c *Conn) readMessage(mode rootprotocol.ParserMode) (any, error) {
 
 	totalRead := 0
 	for !p.Complete() {
-		n, err := c.reader.Read(c.readBuf)
+		data, err := c.readNextChunk()
+		n := len(data)
 		if n > 0 {
 			totalRead += n
 			if totalRead > c.maxMessageSize {
 				return nil, errors.New("http1 message too large")
 			}
-			if _, feedErr := p.Feed(c.readBuf[:n]); feedErr != nil {
+			consumed, feedErr := p.Feed(data)
+			if consumed < len(data) {
+				c.unread(data[consumed:])
+			}
+			if feedErr != nil {
 				return nil, feedErr
 			}
 		}
@@ -279,6 +397,70 @@ func formatChunkedRequest(req *core.Request, body []byte, dst []byte) []byte {
 	dst = append(dst, '\r', '\n')
 	dst = appendChunkedBody(dst, body, &req.Trailers)
 	return dst
+}
+
+func (c *Conn) readNextChunk() ([]byte, error) {
+	if len(c.pending) > 0 {
+		data := c.pending
+		c.pending = nil
+		return data, nil
+	}
+	n, err := c.reader.Read(c.readBuf)
+	if n == 0 {
+		return nil, err
+	}
+	return c.readBuf[:n], err
+}
+
+func (c *Conn) unread(data []byte) {
+	if len(data) == 0 {
+		return
+	}
+	c.pending = append(c.pending[:0], data...)
+}
+
+func (c *Conn) consumeTrailerSection(trailers *core.Headers) error {
+	var lineBuf []byte
+	for {
+		data, err := c.readNextChunk()
+		if len(data) > 0 {
+			if idx := bytes.Index(data, []byte("\r\n")); idx >= 0 {
+				line := append(lineBuf, data[:idx]...)
+				lineBuf = nil
+				if idx+2 < len(data) {
+					c.unread(data[idx+2:])
+				}
+				if len(line) > maxTrailerLineBytes {
+					return errors.New("http1 trailer line too large")
+				}
+				if len(line) == 0 {
+					return nil
+				}
+				if err := appendTrailerHeader(trailers, line); err != nil {
+					return err
+				}
+				continue
+			}
+			lineBuf = append(lineBuf, data...)
+			if len(lineBuf) > maxTrailerLineBytes {
+				return errors.New("http1 trailer line too large")
+			}
+		}
+		if err != nil {
+			return err
+		}
+	}
+}
+
+func appendTrailerHeader(trailers *core.Headers, line []byte) error {
+	sep := bytes.IndexByte(line, ':')
+	if sep <= 0 {
+		return errors.New("invalid trailer")
+	}
+	name := bytes.TrimSpace(line[:sep])
+	value := bytes.TrimSpace(line[sep+1:])
+	trailers.Append(name, value)
+	return nil
 }
 
 func formatChunkedResponse(resp *core.Response, body []byte, dst []byte) []byte {
