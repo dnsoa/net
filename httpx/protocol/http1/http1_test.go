@@ -189,6 +189,53 @@ func TestConnReadStreamResponseChunkedTrailerTooLarge(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected oversized trailer to fail")
 	}
+
+	chunkedReader, ok := bodyReader.(*chunkedBodyReader)
+	if !ok {
+		t.Fatalf("expected chunkedBodyReader, got %T", bodyReader)
+	}
+	if chunkedReader.p != nil {
+		t.Fatal("expected parser to be released after trailer parse failure")
+	}
+	if err := chunkedReader.Close(); err != nil {
+		t.Fatalf("close after trailer parse failure: %v", err)
+	}
+}
+
+func TestChunkedBodyReader_ReadAfterEOFAndCloseIsSafe(t *testing.T) {
+	input := bytes.NewBufferString("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n")
+	conn := NewConn(input, nil)
+	defer conn.Close()
+
+	resp, bodyReader, err := conn.ReadStreamResponse()
+	if err != nil {
+		t.Fatalf("read stream response: %v", err)
+	}
+	defer core.ReleaseResponse(resp)
+
+	chunkedReader, ok := bodyReader.(*chunkedBodyReader)
+	if !ok {
+		t.Fatalf("expected chunkedBodyReader, got %T", bodyReader)
+	}
+
+	body, err := io.ReadAll(chunkedReader)
+	if err != nil {
+		t.Fatalf("read chunked body: %v", err)
+	}
+	if string(body) != "hello" {
+		t.Fatalf("unexpected chunked body %q", body)
+	}
+	if chunkedReader.p != nil {
+		t.Fatal("expected parser to be released after EOF")
+	}
+
+	_, err = chunkedReader.Read(make([]byte, 1))
+	if err != io.EOF {
+		t.Fatalf("expected EOF on repeated read, got %v", err)
+	}
+	if err := chunkedReader.Close(); err != nil {
+		t.Fatalf("close after EOF: %v", err)
+	}
 }
 
 func TestConnReadRequestKeepAliveHTTP10(t *testing.T) {

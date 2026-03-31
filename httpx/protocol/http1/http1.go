@@ -6,7 +6,6 @@ import (
 	"errors"
 	"io"
 	"strconv"
-	"sync"
 
 	"github.com/dnsoa/net/httpx/core"
 	rootprotocol "github.com/dnsoa/net/httpx/protocol"
@@ -179,6 +178,7 @@ func (c *Conn) ReadStreamResponse() (*core.Response, io.Reader, error) {
 	resp.Version = p.Version
 	resp.Status = core.NewStatus(p.StatusCode)
 	resp.Headers = p.Headers
+	p.Headers = core.NewHeaders()
 	c.keepAlive = resp.Headers.IsKeepAlive(resp.Version)
 
 	contentLength := p.ContentLength()
@@ -204,97 +204,107 @@ func (c *Conn) ReadStreamResponse() (*core.Response, io.Reader, error) {
 }
 
 func (c *Conn) newChunkedBodyReader(p *rootprotocol.Parser, resp *core.Response, bufferedBody []byte) io.Reader {
-	pr, pw := io.Pipe()
-	p.SetBodyWriter(pw)
-	bodyReader := &chunkedBodyReader{
-		reader: pr,
+	return &chunkedBodyReader{
+		conn:     c,
+		p:        p,
+		resp:     resp,
+		buffered: bufferedBody,
 	}
-	if closer, ok := c.reader.(io.Closer); ok {
-		bodyReader.sourceCloser = closer
-	}
-
-	go func() {
-		defer rootprotocol.ReleaseParser(p)
-		defer bodyReader.markCompleted()
-		for !p.Complete() {
-			data, err := c.readNextChunk()
-			if len(data) > 0 {
-				consumed, feedErr := p.Feed(data)
-				if consumed < len(data) {
-					c.unread(data[consumed:])
-				}
-				if feedErr != nil {
-					_ = pw.CloseWithError(feedErr)
-					return
-				}
-			}
-			if err != nil {
-				if errors.Is(err, io.EOF) {
-					p.FinishEOF()
-					if p.Complete() {
-						break
-					}
-				}
-				_ = pw.CloseWithError(err)
-				return
-			}
-		}
-		if err := c.consumeTrailerSection(&resp.Trailers); err != nil {
-			_ = pw.CloseWithError(err)
-			return
-		}
-		_ = pw.Close()
-	}()
-
-	if len(bufferedBody) == 0 {
-		return bodyReader
-	}
-	bodyReader.prefix = bytes.NewReader(bufferedBody)
-	return bodyReader
 }
 
 type chunkedBodyReader struct {
-	prefix        io.Reader
-	reader        *io.PipeReader
-	sourceCloser  io.Closer
-	completed     bool
-	closeOnce     sync.Once
-	completeMutex sync.Mutex
+	conn           *Conn
+	p              *rootprotocol.Parser
+	resp           *core.Response
+	buffered       []byte
+	bufferedOffset int
+	trailersDone   bool
+	released       bool
+	terminalErr    error
 }
 
 func (r *chunkedBodyReader) Read(p []byte) (int, error) {
-	if r.prefix != nil {
-		n, err := r.prefix.Read(p)
-		if errors.Is(err, io.EOF) {
-			r.prefix = nil
-			if n > 0 {
+	if r.released {
+		if r.terminalErr != nil {
+			return 0, r.terminalErr
+		}
+		return 0, io.EOF
+	}
+
+	// 先从已缓冲的数据读取
+	if r.bufferedOffset < len(r.buffered) {
+		n := copy(p, r.buffered[r.bufferedOffset:])
+		r.bufferedOffset += n
+		return n, nil
+	}
+
+	// 从连接读取并解析
+	for {
+		if r.p.Complete() {
+			return r.finishRead()
+		}
+
+		data, err := r.conn.readNextChunk()
+		if len(data) > 0 {
+			consumed, feedErr := r.p.Feed(data)
+			if consumed < len(data) {
+				r.conn.unread(data[consumed:])
+			}
+			if feedErr != nil {
+				r.releaseParser(feedErr)
+				return 0, feedErr
+			}
+			// 检查是否有解码后的数据
+			r.buffered = r.p.DrainBodyBuffer()
+			r.bufferedOffset = 0
+			if len(r.buffered) > 0 {
+				n := copy(p, r.buffered)
+				r.bufferedOffset = n
 				return n, nil
 			}
-		} else {
-			return n, err
+		}
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				r.p.FinishEOF()
+				if r.p.Complete() {
+					return r.finishRead()
+				}
+			}
+			r.releaseParser(err)
+			return 0, err
 		}
 	}
-	return r.reader.Read(p)
 }
 
 func (r *chunkedBodyReader) Close() error {
-	var err error
-	r.closeOnce.Do(func() {
-		r.completeMutex.Lock()
-		completed := r.completed
-		r.completeMutex.Unlock()
-		if !completed && r.sourceCloser != nil {
-			_ = r.sourceCloser.Close()
-		}
-		err = r.reader.Close()
-	})
-	return err
+	r.releaseParser(nil)
+	return nil
 }
 
-func (r *chunkedBodyReader) markCompleted() {
-	r.completeMutex.Lock()
-	r.completed = true
-	r.completeMutex.Unlock()
+func (r *chunkedBodyReader) finishRead() (int, error) {
+	if !r.trailersDone {
+		r.trailersDone = true
+		if err := r.conn.consumeTrailerSection(&r.resp.Trailers); err != nil {
+			r.releaseParser(err)
+			return 0, err
+		}
+	}
+	r.releaseParser(io.EOF)
+	return 0, io.EOF
+}
+
+func (r *chunkedBodyReader) releaseParser(err error) {
+	if r.released {
+		return
+	}
+	if err != nil {
+		r.terminalErr = err
+	}
+	if r.p != nil {
+		rootprotocol.ReleaseParser(r.p)
+		r.p = nil
+	}
+	r.released = true
 }
 
 func (c *Conn) WriteResponseHead(resp *core.Response) (io.Writer, error) {
