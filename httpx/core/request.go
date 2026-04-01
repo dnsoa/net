@@ -3,7 +3,6 @@ package core
 import (
 	"io"
 
-	"github.com/dnsoa/go/allocator"
 	gosync "github.com/dnsoa/go/sync"
 )
 
@@ -15,7 +14,6 @@ type Request struct {
 	Trailers      Headers
 	Body          io.ReadCloser
 	ContentLength int64
-	alloc         *allocator.Allocator
 }
 
 var requestPool = gosync.NewPool(func() *Request {
@@ -46,15 +44,7 @@ func (r *Request) Host() []byte {
 	return r.Headers.Get("Host")
 }
 
-func (r *Request) SetAllocator(alloc *allocator.Allocator) {
-	r.alloc = alloc
-	r.URI.SetAllocator(alloc)
-	r.Headers.SetAllocator(alloc)
-	r.Trailers.SetAllocator(alloc)
-}
-
 func (r *Request) Reset() {
-	alloc := r.alloc
 	r.Headers.Reset()
 	r.Trailers.Reset()
 	r.URI.Reset()
@@ -67,21 +57,6 @@ func (r *Request) Reset() {
 		Headers:  NewHeaders(),
 		Trailers: NewHeaders(),
 	}
-	if alloc != nil {
-		r.SetAllocator(alloc)
-	}
-}
-
-func (r *Request) Init(method Method, rawURL string) error {
-	r.Method = method
-	r.Version = VersionHTTP11
-	if err := r.URI.ParseString(rawURL); err != nil {
-		return err
-	}
-	if len(r.URI.Host) > 0 {
-		r.Headers.Set(HeaderHost, r.URI.Host)
-	}
-	return nil
 }
 
 // SetBody sets the request body. The caller is responsible for setting

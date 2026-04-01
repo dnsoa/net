@@ -1,9 +1,6 @@
 package core
 
-import (
-	"bytes"
-	"time"
-)
+import "bytes"
 
 type Method uint8
 
@@ -153,100 +150,4 @@ func (v Version) UsesQUIC() bool {
 
 func (v Version) RequiresTLS() bool {
 	return v == VersionHTTP2 || v == VersionHTTP3
-}
-
-type Timeouts struct {
-	Connect   time.Duration
-	Read      time.Duration
-	Write     time.Duration
-	KeepAlive time.Duration
-	Idle      time.Duration
-	Request   time.Duration
-}
-
-func UniformTimeouts(d time.Duration) Timeouts {
-	return Timeouts{
-		Connect:   d,
-		Read:      d,
-		Write:     d,
-		KeepAlive: d * 2,
-		Idle:      d * 4,
-	}
-}
-
-type RetryPolicy struct {
-	MaxRetries             uint32
-	InitialDelay           time.Duration
-	MaxDelay               time.Duration
-	BackoffMultiplier      float64
-	RetryOnStatus          []int
-	RetryOnConnectionError bool
-	RetryOnlyIdempotent    bool
-}
-
-func DefaultRetryPolicy() RetryPolicy {
-	return RetryPolicy{
-		MaxRetries:             3,
-		InitialDelay:           time.Second,
-		MaxDelay:               30 * time.Second,
-		BackoffMultiplier:      2,
-		RetryOnStatus:          []int{429, 500, 502, 503, 504},
-		RetryOnConnectionError: true,
-		RetryOnlyIdempotent:    true,
-	}
-}
-
-func (p RetryPolicy) Delay(attempt uint32) time.Duration {
-	if attempt == 0 {
-		return 0
-	}
-	delay := float64(p.InitialDelay)
-	for i := uint32(1); i < attempt; i++ {
-		delay *= p.BackoffMultiplier
-	}
-	out := time.Duration(delay)
-	if out > p.MaxDelay {
-		return p.MaxDelay
-	}
-	return out
-}
-
-func (p RetryPolicy) ShouldRetryStatus(code int) bool {
-	for _, status := range p.RetryOnStatus {
-		if status == code {
-			return true
-		}
-	}
-	return false
-}
-
-type RedirectPolicy struct {
-	MaxRedirects     uint32
-	FollowRedirects  bool
-	PreserveMethod   bool
-	PreserveHeaders  bool
-	AllowCrossOrigin bool
-}
-
-func DefaultRedirectPolicy() RedirectPolicy {
-	return RedirectPolicy{
-		MaxRedirects:     10,
-		FollowRedirects:  true,
-		PreserveHeaders:  true,
-		AllowCrossOrigin: true,
-	}
-}
-
-func (p RedirectPolicy) RedirectMethod(statusCode int, original Method) Method {
-	if p.PreserveMethod {
-		return original
-	}
-	switch statusCode {
-	case 301, 302, 303:
-		return MethodGet
-	case 307, 308:
-		return original
-	default:
-		return original
-	}
 }

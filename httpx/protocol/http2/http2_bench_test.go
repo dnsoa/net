@@ -6,6 +6,15 @@ import (
 	"github.com/dnsoa/net/httpx/core"
 )
 
+func initRequest(req *core.Request, method core.Method, rawURL string) {
+	req.Method = method
+	req.Version = core.VersionHTTP11
+	req.URI.ParseString(rawURL)
+	if len(req.URI.Host) > 0 {
+		req.Headers.Set(core.HeaderHost, req.URI.Host)
+	}
+}
+
 // Benchmark HTTP/2 frame header encoding
 func BenchmarkFrameHeaderSerialize(b *testing.B) {
 	hdr := FrameHeader{
@@ -42,7 +51,7 @@ func BenchmarkStreamManagerBuildRequestHeaders(b *testing.B) {
 	mgr := NewStreamManager(true, DefaultConnectionSettings(), DefaultConnectionSettings())
 	req := core.AcquireRequest()
 	defer core.ReleaseRequest(req)
-	req.Init(core.MethodPost, "https://example.com/api")
+	initRequest(req, core.MethodPost, "https://example.com/api")
 	req.Headers.SetString("content-type", "application/json")
 	req.Headers.SetString("authorization", "Bearer token123")
 	req.Headers.SetString("x-request-id", "abc-123-def")

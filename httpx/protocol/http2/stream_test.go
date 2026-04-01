@@ -133,9 +133,7 @@ func TestBuildRequestHeaderFramesAndDecode(t *testing.T) {
 	}
 	req := core.AcquireRequest()
 	defer core.ReleaseRequest(req)
-	if err := req.Init(core.MethodPost, "https://example.com/upload?part=1"); err != nil {
-		t.Fatalf("init request: %v", err)
-	}
+	initRequest(req, core.MethodPost, "https://example.com/upload?part=1")
 	req.Headers.SetString("content-type", "application/json")
 	req.Headers.SetString("x-trace-id", "abc123")
 

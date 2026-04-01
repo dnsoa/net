@@ -15,6 +15,15 @@ func nopCloser(b []byte) io.ReadCloser {
 	return io.NopCloser(bytes.NewReader(b))
 }
 
+func initRequest(req *core.Request, method core.Method, rawURL string) {
+	req.Method = method
+	req.Version = core.VersionHTTP11
+	req.URI.ParseString(rawURL)
+	if len(req.URI.Host) > 0 {
+		req.Headers.Set(core.HeaderHost, req.URI.Host)
+	}
+}
+
 // ============================================================================
 // HTTP/1 Benchmarks - Request Write/Read
 // ============================================================================
@@ -23,7 +32,7 @@ func nopCloser(b []byte) io.ReadCloser {
 func BenchmarkHTTP1RequestWrite_GET(b *testing.B) {
 	req := core.AcquireRequest()
 	defer core.ReleaseRequest(req)
-	req.Init(core.MethodGet, "https://example.com/api/users")
+	initRequest(req, core.MethodGet, "https://example.com/api/users")
 	req.Headers.SetString("Accept", "application/json")
 	req.Headers.SetString("User-Agent", "Benchmark/1.0")
 
@@ -45,7 +54,7 @@ func BenchmarkHTTP1RequestWrite_GET(b *testing.B) {
 func BenchmarkHTTP1RequestWrite_POST(b *testing.B) {
 	req := core.AcquireRequest()
 	defer core.ReleaseRequest(req)
-	req.Init(core.MethodPost, "https://example.com/api/users")
+	initRequest(req, core.MethodPost, "https://example.com/api/users")
 	req.Headers.SetString("Content-Type", "application/json")
 	req.SetBody(nopCloser([]byte(`{"name":"John Doe","email":"john@example.com"}`)))
 
@@ -67,7 +76,7 @@ func BenchmarkHTTP1RequestWrite_POST(b *testing.B) {
 func BenchmarkHTTP1RequestWrite_Chunked(b *testing.B) {
 	req := core.AcquireRequest()
 	defer core.ReleaseRequest(req)
-	req.Init(core.MethodPost, "https://example.com/upload")
+	initRequest(req, core.MethodPost, "https://example.com/upload")
 	req.Headers.Set(core.HeaderTransferEncoding, []byte("chunked"))
 	req.Body = nopCloser(make([]byte, 16384)) // 16KB body
 
@@ -233,26 +242,23 @@ func BenchmarkHTTP1ResponseRead_Chunked(b *testing.B) {
 }
 
 // ============================================================================
-// HTTP/2 Benchmarks - Request Write/Read
+// HTTP/2 Benchmarks - Request/Response Frame Building
 // ============================================================================
 
-// BenchmarkHTTP2RequestWrite tests writing an HTTP/2 request
-func BenchmarkHTTP2RequestWrite(b *testing.B) {
+// BenchmarkHTTP2RequestFrameBuilding tests building HTTP/2 request header frames
+func BenchmarkHTTP2RequestFrameBuilding(b *testing.B) {
 	req := core.AcquireRequest()
 	defer core.ReleaseRequest(req)
-	req.Init(core.MethodPost, "https://example.com/api/users")
+	initRequest(req, core.MethodPost, "https://example.com/api/users")
 	req.Headers.SetString("content-type", "application/json")
 	req.Headers.SetString("authorization", "Bearer token123")
-	req.SetBody(nopCloser([]byte(`{"name":"Test User"}`)))
 
 	b.ResetTimer()
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		var writer mockWriter
-		session := protohttp2.NewClientSession(&readerStub{}, &writer)
-		if _, err := session.WriteRequest(req); err != nil {
-			b.Fatal(err)
-		}
+		mgr := protohttp2.NewStreamManager(true, protohttp2.DefaultConnectionSettings(), protohttp2.DefaultConnectionSettings())
+		stream, _ := mgr.OpenStream()
+		_, _ = mgr.BuildRequestHeaderFrames(stream.ID, req, true)
 	}
 }
 
@@ -320,7 +326,7 @@ func BenchmarkHTTP2MultipleStreams(b *testing.B) {
 	requests := make([]*core.Request, streamCount)
 	for i := 0; i < streamCount; i++ {
 		req := core.AcquireRequest()
-		req.Init(core.MethodGet, "https://example.com/api/resource")
+		initRequest(req, core.MethodGet, "https://example.com/api/resource")
 		requests[i] = req
 	}
 	defer func() {
@@ -332,12 +338,10 @@ func BenchmarkHTTP2MultipleStreams(b *testing.B) {
 	b.ResetTimer()
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		var writer mockWriter
-		session := protohttp2.NewClientSession(&readerStub{}, &writer)
+		mgr := protohttp2.NewStreamManager(true, protohttp2.DefaultConnectionSettings(), protohttp2.DefaultConnectionSettings())
 		for _, req := range requests {
-			if _, err := session.WriteRequest(req); err != nil {
-				b.Fatal(err)
-			}
+			stream, _ := mgr.OpenStream()
+			_, _ = mgr.BuildRequestHeaderFrames(stream.ID, req, true)
 		}
 	}
 }
@@ -353,7 +357,7 @@ func BenchmarkHTTP3RequestEncode(b *testing.B) {
 
 	req := core.AcquireRequest()
 	defer core.ReleaseRequest(req)
-	req.Init(core.MethodPost, "https://example.com/api/data")
+	initRequest(req, core.MethodPost, "https://example.com/api/data")
 	req.Headers.SetString("content-type", "application/json")
 	req.Headers.SetString("authorization", "Bearer token123abc")
 	req.Headers.SetString("x-request-id", "req-123-456")
@@ -375,7 +379,7 @@ func BenchmarkHTTP3RequestDecode(b *testing.B) {
 	codec.SetLocalCapacity(4096)
 
 	req := core.AcquireRequest()
-	req.Init(core.MethodGet, "https://example.com/api/users")
+	initRequest(req, core.MethodGet, "https://example.com/api/users")
 	req.Headers.SetString("user-agent", "Mozilla/5.0")
 	req.Headers.SetString("accept", "application/json")
 	encoded, _ := codec.EncodeRequest(req)
@@ -438,14 +442,14 @@ func BenchmarkHTTP3ResponseDecode(b *testing.B) {
 }
 
 // ============================================================================
-// Comparative Benchmarks - HTTP/1 vs HTTP/2 vs HTTP/3
+// Comparative Benchmarks - HTTP/1 vs HTTP/3
 // ============================================================================
 
 // BenchmarkCompareRequestEncoding compares request encoding across protocols
 func BenchmarkCompareRequestEncoding_HTTP1(b *testing.B) {
 	req := core.AcquireRequest()
 	defer core.ReleaseRequest(req)
-	req.Init(core.MethodGet, "https://example.com/api/data")
+	initRequest(req, core.MethodGet, "https://example.com/api/data")
 	req.Headers.SetString("Accept", "application/json")
 
 	var buf bytes.Buffer
@@ -463,17 +467,15 @@ func BenchmarkCompareRequestEncoding_HTTP1(b *testing.B) {
 func BenchmarkCompareRequestEncoding_HTTP2(b *testing.B) {
 	req := core.AcquireRequest()
 	defer core.ReleaseRequest(req)
-	req.Init(core.MethodGet, "https://example.com/api/data")
+	initRequest(req, core.MethodGet, "https://example.com/api/data")
 	req.Headers.SetString("accept", "application/json")
-
-	var writer mockWriter
-	session := protohttp2.NewClientSession(&readerStub{}, &writer)
 
 	b.ResetTimer()
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		writer.bytesWritten = 0
-		_, _ = session.WriteRequest(req)
+		mgr := protohttp2.NewStreamManager(true, protohttp2.DefaultConnectionSettings(), protohttp2.DefaultConnectionSettings())
+		stream, _ := mgr.OpenStream()
+		_, _ = mgr.BuildRequestHeaderFrames(stream.ID, req, true)
 	}
 }
 
@@ -482,7 +484,7 @@ func BenchmarkCompareRequestEncoding_HTTP3(b *testing.B) {
 
 	req := core.AcquireRequest()
 	defer core.ReleaseRequest(req)
-	req.Init(core.MethodGet, "https://example.com/api/data")
+	initRequest(req, core.MethodGet, "https://example.com/api/data")
 	req.Headers.SetString("accept", "application/json")
 
 	b.ResetTimer()
@@ -519,14 +521,12 @@ func BenchmarkCompareResponseEncoding_HTTP2(b *testing.B) {
 	resp.Headers.SetString("content-type", "application/json")
 	resp.SetBody(nopCloser([]byte(`{"result":"success"}`)))
 
-	var writer mockWriter
-	session := protohttp2.NewServerSession(&readerStub{}, &writer)
-
 	b.ResetTimer()
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		writer.bytesWritten = 0
-		_ = session.WriteResponse(1, resp)
+		mgr := protohttp2.NewStreamManager(false, protohttp2.DefaultConnectionSettings(), protohttp2.DefaultConnectionSettings())
+		mgr.Streams[1] = &protohttp2.Stream{ID: 1, State: protohttp2.StreamOpen, SendWindow: 65535, RecvWindow: 65535}
+		_, _ = mgr.BuildResponseHeaderFrames(1, resp, true)
 	}
 }
 
@@ -544,55 +544,4 @@ func BenchmarkCompareResponseEncoding_HTTP3(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		_, _ = codec.EncodeResponse(resp)
 	}
-}
-
-// ============================================================================
-// Mock types for testing
-// ============================================================================
-
-type mockWriter struct {
-	bytesWritten int
-}
-
-func (m *mockWriter) Write(p []byte) (n int, err error) {
-	m.bytesWritten += len(p)
-	return len(p), nil
-}
-
-type readerStub struct{}
-
-func (r *readerStub) Read(p []byte) (n int, err error) {
-	return 0, io.EOF
-}
-
-type writerStub struct{}
-
-func (w *writerStub) Write(p []byte) (n int, err error) {
-	return len(p), nil
-}
-
-type frameReader struct {
-	frames []protohttp2.Frame
-	offset int
-}
-
-func (r *frameReader) Read(p []byte) (n int, err error) {
-	if r.offset >= len(r.frames) {
-		return 0, io.EOF
-	}
-	// Return frame data (simplified for benchmarking)
-	frame := r.frames[r.offset]
-	if len(p) < 9 { // Frame header size
-		return 0, io.EOF
-	}
-	// Write frame header
-	hdr := frame.Header.Serialize()
-	copy(p, hdr[:9])
-	n = 9
-	if len(frame.Payload) > 0 && len(p) > 9 {
-		copy(p[9:], frame.Payload)
-		n += len(frame.Payload)
-	}
-	r.offset++
-	return n, nil
 }

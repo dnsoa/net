@@ -12,9 +12,7 @@ import (
 func TestFormatRequestAddsContentLength(t *testing.T) {
 	req := core.AcquireRequest()
 	defer core.ReleaseRequest(req)
-	if err := req.Init(core.MethodPost, "https://example.com/upload"); err != nil {
-		t.Fatalf("init request: %v", err)
-	}
+	initRequest(req, core.MethodPost, "https://example.com/upload")
 	req.SetBody(io.NopCloser(bytes.NewReader([]byte("hello"))))
 	body, _ := req.ReadAll()
 	encoded := FormatRequest(req, body, nil)
@@ -100,9 +98,7 @@ func TestFormatResponseChunked(t *testing.T) {
 func TestFormatRequestChunkedWithTrailers(t *testing.T) {
 	req := core.AcquireRequest()
 	defer core.ReleaseRequest(req)
-	if err := req.Init(core.MethodPost, "https://example.com/upload"); err != nil {
-		t.Fatalf("init request: %v", err)
-	}
+	initRequest(req, core.MethodPost, "https://example.com/upload")
 	req.Headers.Set(core.HeaderTransferEncoding, []byte("chunked"))
 	req.SetBody(io.NopCloser(bytes.NewReader([]byte("hello"))))
 	req.Trailers.SetString("x-origin-status", "stale")

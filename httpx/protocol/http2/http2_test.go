@@ -3,8 +3,6 @@ package http2
 import (
 	"bytes"
 	"testing"
-
-	"github.com/dnsoa/net/httpx/core"
 )
 
 func TestFrameHeaderSerializeParse(t *testing.T) {
@@ -57,22 +55,5 @@ func TestConnHandshakeAndFrameIO(t *testing.T) {
 	}
 	if frame.Header.Type != FramePing || string(frame.Payload) != "abc" {
 		t.Fatalf("unexpected second frame: %+v payload=%q", frame.Header, frame.Payload)
-	}
-}
-
-func TestNegotiateVersionAndH2C(t *testing.T) {
-	if NegotiateVersion([]byte(ALPNHTTP2)) != NegotiatedHTTP2 {
-		t.Fatal("expected http2 negotiation")
-	}
-	if NegotiateVersion([]byte(ALPNHTTP3)).ToVersion() != core.VersionHTTP3 {
-		t.Fatal("expected http3 version")
-	}
-	headers := core.NewHeaders()
-	defer headers.Reset()
-	headers.Set([]byte("Upgrade"), []byte("h2c"))
-	headers.Set([]byte("Connection"), []byte("Upgrade, HTTP2-Settings"))
-	headers.Set([]byte("HTTP2-Settings"), []byte("AAMAAABkAAQCAAAAAAIAAAAA"))
-	if !IsH2CUpgradeRequest(&headers) {
-		t.Fatal("expected valid h2c upgrade request")
 	}
 }

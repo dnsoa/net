@@ -1,35 +1,10 @@
 package http2
 
 import (
-	"bytes"
 	"encoding/binary"
 	"errors"
 	"io"
-
-	"github.com/dnsoa/net/httpx/core"
 )
-
-type NegotiatedProtocol uint8
-
-const (
-	NegotiatedHTTP10 NegotiatedProtocol = iota
-	NegotiatedHTTP11
-	NegotiatedHTTP2
-	NegotiatedHTTP3
-)
-
-func (p NegotiatedProtocol) ToVersion() core.Version {
-	switch p {
-	case NegotiatedHTTP10:
-		return core.VersionHTTP10
-	case NegotiatedHTTP2:
-		return core.VersionHTTP2
-	case NegotiatedHTTP3:
-		return core.VersionHTTP3
-	default:
-		return core.VersionHTTP11
-	}
-}
 
 const (
 	ALPNHTTP11 = "http/1.1"
@@ -37,34 +12,6 @@ const (
 	ALPNHTTP3  = "h3"
 	Preface    = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
 )
-
-func NegotiateVersion(alpn []byte) NegotiatedProtocol {
-	switch string(alpn) {
-	case ALPNHTTP3:
-		return NegotiatedHTTP3
-	case ALPNHTTP2:
-		return NegotiatedHTTP2
-	case ALPNHTTP11:
-		return NegotiatedHTTP11
-	default:
-		return NegotiatedHTTP11
-	}
-}
-
-func IsH2CUpgradeRequest(headers *core.Headers) bool {
-	upgrade := headers.Get("Upgrade")
-	if upgrade == nil || !bytes.EqualFold(upgrade, []byte("h2c")) {
-		return false
-	}
-	connection := headers.Get("Connection")
-	if connection == nil {
-		return false
-	}
-	if !core.ContainsTokenCI(connection, []byte("Upgrade")) {
-		return false
-	}
-	return headers.Get("HTTP2-Settings") != nil
-}
 
 type FrameType uint8
 

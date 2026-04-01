@@ -24,22 +24,16 @@ type HeaderEntry struct {
 
 type Headers struct {
 	entries []HeaderEntry
-	alloc   *allocator.Allocator
 }
 
 func NewHeaders() Headers {
 	return Headers{}
 }
 
-func (h *Headers) SetAllocator(alloc *allocator.Allocator) {
-	h.alloc = alloc
-}
-
 func (h *Headers) Reset() {
+	alloc := getDefaultAllocator()
 	for i := range h.entries {
-		if h.entries[i].buf != nil && h.alloc != nil {
-			h.alloc.Put(h.entries[i].buf)
-		}
+		alloc.Put(h.entries[i].buf)
 		h.entries[i] = HeaderEntry{}
 	}
 	h.entries = h.entries[:0]
@@ -55,29 +49,32 @@ func (h *Headers) Entries() []HeaderEntry {
 
 func (h *Headers) Append(name, value []byte) {
 	totalLen := len(name) + len(value)
-	if h.alloc != nil {
-		buf := h.alloc.Get(totalLen)
-		nLen := len(name)
-		copy((*buf)[:nLen], name)
-		copy((*buf)[nLen:], value)
-		h.entries = append(h.entries, HeaderEntry{
-			Name:  (*buf)[:nLen],
-			Value: (*buf)[nLen:],
-			buf:   buf,
-		})
-	} else {
-		owned := make([]byte, totalLen)
-		copy(owned[:len(name)], name)
-		copy(owned[len(name):], value)
-		h.entries = append(h.entries, HeaderEntry{
-			Name:  owned[:len(name)],
-			Value: owned[len(name):],
-		})
-	}
+	alloc := getDefaultAllocator()
+	buf := alloc.Get(totalLen)
+	nLen := len(name)
+	copy((*buf)[:nLen], name)
+	copy((*buf)[nLen:], value)
+	h.entries = append(h.entries, HeaderEntry{
+		Name:  (*buf)[:nLen],
+		Value: (*buf)[nLen:],
+		buf:   buf,
+	})
 }
 
+// AppendString appends a header entry with string name and value.
+// Avoids temporary []byte allocations by converting directly into the owned buffer.
 func (h *Headers) AppendString(name, value string) {
-	h.Append([]byte(name), []byte(value))
+	totalLen := len(name) + len(value)
+	alloc := getDefaultAllocator()
+	buf := alloc.Get(totalLen)
+	nLen := len(name)
+	copy((*buf)[:nLen], name)
+	copy((*buf)[nLen:], value)
+	h.entries = append(h.entries, HeaderEntry{
+		Name:  (*buf)[:nLen],
+		Value: (*buf)[nLen:],
+		buf:   buf,
+	})
 }
 
 func (h *Headers) Set(name, value []byte) {
@@ -85,14 +82,37 @@ func (h *Headers) Set(name, value []byte) {
 	h.Append(name, value)
 }
 
+// SetString sets a header entry with string name and value.
 func (h *Headers) SetString(name, value string) {
-	h.Set([]byte(name), []byte(value))
+	h.RemoveAllString(name)
+	h.AppendString(name, value)
+}
+
+// equalFoldString compares a []byte with a string case-insensitively
+// without allocating a temporary []byte from the string.
+func equalFoldString(b []byte, s string) bool {
+	if len(b) != len(s) {
+		return false
+	}
+	for i := range b {
+		cb := b[i]
+		cs := s[i]
+		if cb >= 'A' && cb <= 'Z' {
+			cb += 0x20
+		}
+		if cs >= 'A' && cs <= 'Z' {
+			cs += 0x20
+		}
+		if cb != cs {
+			return false
+		}
+	}
+	return true
 }
 
 func (h *Headers) Get(name string) []byte {
-	needle := []byte(name)
 	for i := range h.entries {
-		if bytes.EqualFold(h.entries[i].Name, needle) {
+		if equalFoldString(h.entries[i].Name, name) {
 			return h.entries[i].Value
 		}
 	}
@@ -104,10 +124,9 @@ func (h *Headers) Contains(name string) bool {
 }
 
 func (h *Headers) GetAll(name string) [][]byte {
-	needle := []byte(name)
 	values := make([][]byte, 0, 2)
 	for i := range h.entries {
-		if bytes.EqualFold(h.entries[i].Name, needle) {
+		if equalFoldString(h.entries[i].Name, name) {
 			values = append(values, h.entries[i].Value)
 		}
 	}
@@ -115,12 +134,26 @@ func (h *Headers) GetAll(name string) [][]byte {
 }
 
 func (h *Headers) RemoveAll(name []byte) {
+	alloc := getDefaultAllocator()
 	out := h.entries[:0]
 	for _, entry := range h.entries {
 		if bytes.EqualFold(entry.Name, name) {
-			if entry.buf != nil && h.alloc != nil {
-				h.alloc.Put(entry.buf)
-			}
+			alloc.Put(entry.buf)
+			continue
+		}
+		out = append(out, entry)
+	}
+	h.entries = out
+}
+
+// RemoveAllString removes all entries with the given header name (string).
+// Avoids temporary []byte allocation from string conversion.
+func (h *Headers) RemoveAllString(name string) {
+	alloc := getDefaultAllocator()
+	out := h.entries[:0]
+	for _, entry := range h.entries {
+		if equalFoldString(entry.Name, name) {
+			alloc.Put(entry.buf)
 			continue
 		}
 		out = append(out, entry)
@@ -130,7 +163,6 @@ func (h *Headers) RemoveAll(name []byte) {
 
 func (h *Headers) Clone() Headers {
 	clone := NewHeaders()
-	clone.alloc = h.alloc
 	for _, entry := range h.entries {
 		clone.Append(entry.Name, entry.Value)
 	}

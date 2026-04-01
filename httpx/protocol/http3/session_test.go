@@ -237,9 +237,7 @@ func TestQpackRequestResponseRoundTrip(t *testing.T) {
 	codec := NewQpackCodec()
 	req := core.AcquireRequest()
 	defer core.ReleaseRequest(req)
-	if err := req.Init(core.MethodGet, "https://example.com/video/seg.ts?part=1"); err != nil {
-		t.Fatalf("init request: %v", err)
-	}
+	initRequest(req, core.MethodGet, "https://example.com/video/seg.ts?part=1")
 	req.Headers.SetString("accept-encoding", "gzip, deflate, br")
 	req.Headers.SetString("x-cache-key", "video:seg")
 	block, err := codec.EncodeRequest(req)
@@ -357,9 +355,7 @@ func TestSessionControlAndMessageRoundTrip(t *testing.T) {
 
 	req := core.AcquireRequest()
 	defer core.ReleaseRequest(req)
-	if err := req.Init(core.MethodPost, "https://origin.example.com/cache/fill?id=1"); err != nil {
-		t.Fatalf("init request: %v", err)
-	}
+	initRequest(req, core.MethodPost, "https://origin.example.com/cache/fill?id=1")
 	req.SetBody(io.NopCloser(bytes.NewReader([]byte("chunk-a"))))
 	req.Trailers.SetString("x-origin-etag", "abc")
 
@@ -438,9 +434,7 @@ func TestSessionQpackStreamsRoundTrip(t *testing.T) {
 
 	makeRequest := func() *core.Request {
 		req := core.AcquireRequest()
-		if err := req.Init(core.MethodGet, "https://origin.example.com/cache/item.ts"); err != nil {
-			t.Fatalf("init request: %v", err)
-		}
+		initRequest(req, core.MethodGet, "https://origin.example.com/cache/item.ts")
 		req.Headers.SetString("x-cache-key", "asset:42")
 		return req
 	}
@@ -545,9 +539,7 @@ func TestTransportRoundTripLifecycleClosesStream(t *testing.T) {
 
 	req := core.AcquireRequest()
 	defer core.ReleaseRequest(req)
-	if err := req.Init(core.MethodGet, "https://cdn.example.com/object"); err != nil {
-		t.Fatalf("init request: %v", err)
-	}
+	initRequest(req, core.MethodGet, "https://cdn.example.com/object")
 	gotResp, err := transport.RoundTrip(req)
 	if err != nil {
 		t.Fatalf("round trip: %v", err)
@@ -608,9 +600,7 @@ func TestTransportRoundTripContextCancelsStream(t *testing.T) {
 
 	req := core.AcquireRequest()
 	defer core.ReleaseRequest(req)
-	if err := req.Init(core.MethodGet, "https://cdn.example.com/cancel-me"); err != nil {
-		t.Fatalf("init request: %v", err)
-	}
+	initRequest(req, core.MethodGet, "https://cdn.example.com/cancel-me")
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -694,9 +684,7 @@ func TestTransportRoundTripIntegratesQPACKStreams(t *testing.T) {
 
 	makeRequest := func() *core.Request {
 		req := core.AcquireRequest()
-		if err := req.Init(core.MethodGet, "https://cdn.example.com/video/seg.ts"); err != nil {
-			t.Fatalf("init request: %v", err)
-		}
+		initRequest(req, core.MethodGet, "https://cdn.example.com/video/seg.ts")
 		req.Version = core.VersionHTTP3
 		req.Headers.SetString("x-cache-key", "asset:42")
 		req.Headers.SetString("x-origin-name", "origin-a")

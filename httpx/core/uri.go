@@ -18,59 +18,38 @@ type URI struct {
 	Fragment []byte
 	Port     uint16
 	HasPort  bool
-	alloc    *allocator.Allocator
 	rawBuf   *allocator.Buffer
 }
 
-func (u *URI) SetAllocator(alloc *allocator.Allocator) {
-	u.alloc = alloc
-}
-
 func (u *URI) Reset() {
-	if u.rawBuf != nil && u.alloc != nil {
-		u.alloc.Put(u.rawBuf)
+	alloc := getDefaultAllocator()
+	if u.rawBuf != nil {
+		alloc.Put(u.rawBuf)
 	}
 	*u = URI{Path: []byte("/")}
 }
 
 func (u *URI) ParseString(raw string) error {
-	rawBytes := []byte(raw)
-	if u.alloc != nil {
-		buf := u.alloc.Get(len(rawBytes))
-		copy(*buf, rawBytes)
-		return u.parseFromBuffer(buf)
+	alloc := getDefaultAllocator()
+	if u.rawBuf != nil {
+		alloc.Put(u.rawBuf)
 	}
-	owned := make([]byte, len(rawBytes))
-	copy(owned, rawBytes)
-	return u.parseFromBytes(owned)
-}
-
-func (u *URI) ParseOwned(raw []byte) error {
-	if u.alloc != nil {
-		buf := u.alloc.Get(len(raw))
-		copy(*buf, raw)
-		return u.parseFromBuffer(buf)
-	}
-	owned := make([]byte, len(raw))
-	copy(owned, raw)
-	return u.parseFromBytes(owned)
-}
-
-func (u *URI) parseFromBuffer(buf *allocator.Buffer) error {
-	if u.rawBuf != nil && u.alloc != nil {
-		u.alloc.Put(u.rawBuf)
-	}
+	buf := alloc.Get(len(raw))
+	copy(*buf, raw)
 	u.rawBuf = buf
 	u.parse(*buf)
 	return nil
 }
 
-func (u *URI) parseFromBytes(raw []byte) error {
-	if u.rawBuf != nil && u.alloc != nil {
-		u.alloc.Put(u.rawBuf)
-		u.rawBuf = nil
+func (u *URI) ParseOwned(raw []byte) error {
+	alloc := getDefaultAllocator()
+	if u.rawBuf != nil {
+		alloc.Put(u.rawBuf)
 	}
-	u.parse(raw)
+	buf := alloc.Get(len(raw))
+	copy(*buf, raw)
+	u.rawBuf = buf
+	u.parse(*buf)
 	return nil
 }
 

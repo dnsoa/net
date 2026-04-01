@@ -6,6 +6,15 @@ import (
 	"github.com/dnsoa/net/httpx/core"
 )
 
+func initRequest(req *core.Request, method core.Method, rawURL string) {
+	req.Method = method
+	req.Version = core.VersionHTTP11
+	req.URI.ParseString(rawURL)
+	if len(req.URI.Host) > 0 {
+		req.Headers.Set(core.HeaderHost, req.URI.Host)
+	}
+}
+
 // Benchmark variable-length integer encoding
 func BenchmarkAppendVarInt(b *testing.B) {
 	values := []uint64{25, 15293, 494878333, 151288809941952652}
@@ -77,7 +86,7 @@ func BenchmarkQpackEncodeRequest(b *testing.B) {
 	codec := NewQpackCodec()
 	req := core.AcquireRequest()
 	defer core.ReleaseRequest(req)
-	req.Init(core.MethodPost, "https://example.com/api")
+	initRequest(req, core.MethodPost, "https://example.com/api")
 	req.Headers.SetString("content-type", "application/json")
 	req.Headers.SetString("authorization", "Bearer token")
 	req.Headers.SetString("x-request-id", "abc-123")
@@ -109,7 +118,7 @@ func BenchmarkQpackDecodeRequest(b *testing.B) {
 	codec := NewQpackCodec()
 	req := core.AcquireRequest()
 	defer core.ReleaseRequest(req)
-	req.Init(core.MethodGet, "https://example.com/api")
+	initRequest(req, core.MethodGet, "https://example.com/api")
 	req.Headers.SetString("user-agent", "Mozilla/5.0")
 	req.Headers.SetString("accept", "application/json")
 	encoded, _ := codec.EncodeRequest(req)
@@ -144,7 +153,7 @@ func BenchmarkQpackDynamicTableEncoding(b *testing.B) {
 	codec.SetLocalCapacity(4096)
 	req := core.AcquireRequest()
 	defer core.ReleaseRequest(req)
-	req.Init(core.MethodPost, "https://example.com/api")
+	initRequest(req, core.MethodPost, "https://example.com/api")
 	req.Headers.SetString("x-custom-header-1", "value1")
 	req.Headers.SetString("x-custom-header-2", "value2")
 	req.Headers.SetString("x-custom-header-3", "value3")

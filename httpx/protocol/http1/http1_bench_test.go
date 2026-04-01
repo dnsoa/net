@@ -12,11 +12,20 @@ func nopCloser(b []byte) io.ReadCloser {
 	return io.NopCloser(bytes.NewReader(b))
 }
 
+func initRequest(req *core.Request, method core.Method, rawURL string) {
+	req.Method = method
+	req.Version = core.VersionHTTP11
+	req.URI.ParseString(rawURL)
+	if len(req.URI.Host) > 0 {
+		req.Headers.Set(core.HeaderHost, req.URI.Host)
+	}
+}
+
 // Benchmark formatting a simple GET request
 func BenchmarkFormatRequestSimple(b *testing.B) {
 	req := core.AcquireRequest()
 	defer core.ReleaseRequest(req)
-	req.Init(core.MethodGet, "https://example.com/api")
+	initRequest(req, core.MethodGet, "https://example.com/api")
 	b.ResetTimer()
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
@@ -29,7 +38,7 @@ func BenchmarkFormatRequestSimple(b *testing.B) {
 func BenchmarkFormatRequestWithBody(b *testing.B) {
 	req := core.AcquireRequest()
 	defer core.ReleaseRequest(req)
-	req.Init(core.MethodPost, "https://example.com/api")
+	initRequest(req, core.MethodPost, "https://example.com/api")
 	req.SetBody(nopCloser([]byte(`{"name":"test","value":"data"}`)))
 	b.ResetTimer()
 	b.ReportAllocs()
@@ -43,7 +52,7 @@ func BenchmarkFormatRequestWithBody(b *testing.B) {
 func BenchmarkFormatRequestChunked(b *testing.B) {
 	req := core.AcquireRequest()
 	defer core.ReleaseRequest(req)
-	req.Init(core.MethodPost, "https://example.com/upload")
+	initRequest(req, core.MethodPost, "https://example.com/upload")
 	req.Headers.Set(core.HeaderTransferEncoding, []byte("chunked"))
 	req.Body = nopCloser(make([]byte, 8192)) // 8KB body
 	b.ResetTimer()
@@ -73,7 +82,8 @@ func BenchmarkFormatResponseJSON(b *testing.B) {
 	resp := core.AcquireResponse()
 	defer core.ReleaseResponse(resp)
 	resp.Status = core.NewStatus(200)
-	resp.SetJSONBody(map[string]string{"status": "ok", "data": "test"})
+	resp.Headers.SetString("Content-Type", "application/json")
+	resp.SetBody(nopCloser([]byte(`{"status":"ok","data":"test"}`)))
 	b.ResetTimer()
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
@@ -121,7 +131,7 @@ func BenchmarkConnReadResponse(b *testing.B) {
 func BenchmarkConnWriteRequest(b *testing.B) {
 	req := core.AcquireRequest()
 	defer core.ReleaseRequest(req)
-	req.Init(core.MethodGet, "https://example.com/api")
+	initRequest(req, core.MethodGet, "https://example.com/api")
 	req.Headers.SetString("Accept", "application/json")
 	b.ResetTimer()
 	b.ReportAllocs()
@@ -156,7 +166,7 @@ func BenchmarkConnRoundTrip(b *testing.B) {
 		"OK")
 	req := core.AcquireRequest()
 	defer core.ReleaseRequest(req)
-	req.Init(core.MethodGet, "https://example.com/ping")
+	initRequest(req, core.MethodGet, "https://example.com/ping")
 	b.ResetTimer()
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
