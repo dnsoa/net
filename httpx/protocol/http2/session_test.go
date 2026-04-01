@@ -12,6 +12,15 @@ import (
 	"github.com/dnsoa/net/httpx/core"
 )
 
+// newTestServerSession creates a server session without H2 connection preface handshake.
+// Use this for unit tests that don't need real I/O.
+func newTestServerSession(reader io.Reader, writer io.Writer) *Session {
+	conn := NewConn(reader, writer)
+	conn.IsClient = false
+	conn.NextStreamID = 2
+	return newSession(conn, false)
+}
+
 // --- State transition tests (no I/O needed) ---
 
 func TestStreamStateCASOpenToClosedRemote(t *testing.T) {
@@ -42,7 +51,7 @@ func TestStreamStateCASOpenToClosedLocal(t *testing.T) {
 // --- broadcastError test ---
 
 func TestBroadcastError(t *testing.T) {
-	s := NewServerSession(nil, nil)
+	s := newTestServerSession(nil, nil)
 	ss1 := s.registerStream(1, stateOpen)
 	ss2 := s.registerStream(3, stateOpen)
 
@@ -65,12 +74,29 @@ func TestBroadcastError(t *testing.T) {
 	}
 }
 
+func TestBroadcastErrorSkipsHalfClosedRemote(t *testing.T) {
+	s := newTestServerSession(nil, nil)
+	ss := s.registerStream(1, stateHalfClosedRemote)
+
+	testErr := errors.New("received GOAWAY")
+	s.broadcastError(testErr)
+
+	if ss.closed.Load() {
+		t.Fatal("expected half-closed remote stream to remain writable")
+	}
+	select {
+	case err := <-ss.errCh:
+		t.Fatalf("did not expect error for half-closed remote stream, got %v", err)
+	default:
+	}
+}
+
 // --- streamReader with nil dataCh returns EOF ---
 
 func TestStreamReaderNilDataCh(t *testing.T) {
 	sr := &streamReader{
 		dataCh:            nil,
-		session:           NewServerSession(nil, nil),
+		session:           newTestServerSession(nil, nil),
 		recvWindow:        65535,
 		initialWindowSize: 65535,
 	}
@@ -93,7 +119,7 @@ func TestStreamReaderFromDataCh(t *testing.T) {
 	sr := &streamReader{
 		dataCh:            dataCh,
 		errCh:             errCh,
-		session:           NewServerSession(nil, nil),
+		session:           newTestServerSession(nil, nil),
 		recvWindow:        65535,
 		initialWindowSize: 65535,
 	}
@@ -121,7 +147,7 @@ func TestStreamReaderError(t *testing.T) {
 	sr := &streamReader{
 		dataCh:            dataCh,
 		errCh:             errCh,
-		session:           NewServerSession(nil, nil),
+		session:           newTestServerSession(nil, nil),
 		recvWindow:        65535,
 		initialWindowSize: 65535,
 	}
@@ -139,7 +165,7 @@ func TestStreamReaderError(t *testing.T) {
 // --- streamState concurrent access ---
 
 func TestStreamStateConcurrentAccess(t *testing.T) {
-	s := NewServerSession(nil, nil)
+	s := newTestServerSession(nil, nil)
 	const numStreams = 100
 	var wg sync.WaitGroup
 
@@ -186,7 +212,7 @@ func TestStreamWriterWriteAndClose(t *testing.T) {
 	var written bytes.Buffer
 	conn := NewConn(nil, &written)
 	conn.IsClient = false
-	s := NewServerSession(nil, nil)
+	s := newTestServerSession(nil, nil)
 	// Override conn for direct frame writing.
 	s.conn = conn
 	s.streams.PeerSettings.MaxFrameSize = 16384
@@ -217,7 +243,7 @@ func TestStreamWriterWriteAndClose(t *testing.T) {
 // --- streamWriter respects closed flag ---
 
 func TestStreamWriterClosed(t *testing.T) {
-	s := NewServerSession(nil, nil)
+	s := newTestServerSession(nil, nil)
 	ss := s.registerStream(1, stateOpen)
 	ss.closed.Store(true)
 
@@ -259,7 +285,7 @@ func TestReadRequestFromFrameBytes(t *testing.T) {
 
 	// Create server session reading from the buffer.
 	var discard bytes.Buffer
-	server := NewServerSession(&frameBuf, &discard)
+	server := newTestServerSession(&frameBuf, &discard)
 
 	streamID, gotReq, err := server.ReadRequest()
 	if err != nil {
@@ -320,7 +346,7 @@ func TestReadRequestWithBodyFromFrameBytes(t *testing.T) {
 	frameBuf.Write(body)
 
 	var discard bytes.Buffer
-	server := NewServerSession(&frameBuf, &discard)
+	server := newTestServerSession(&frameBuf, &discard)
 
 	streamID, gotReq, err := server.ReadRequest()
 	if err != nil {
@@ -342,7 +368,7 @@ func TestReadRequestWithBodyFromFrameBytes(t *testing.T) {
 func TestWriteResponseIntegration(t *testing.T) {
 	// Set up server session with buffer writer.
 	var out bytes.Buffer
-	server := NewServerSession(nil, &out)
+	server := newTestServerSession(nil, &out)
 	server.conn = NewConn(nil, &out)
 
 	// Register stream state.
@@ -374,7 +400,7 @@ func TestWriteResponseIntegration(t *testing.T) {
 
 func TestWriteResponseNoBody(t *testing.T) {
 	var out bytes.Buffer
-	server := NewServerSession(nil, &out)
+	server := newTestServerSession(nil, &out)
 	server.conn = NewConn(nil, &out)
 	server.registerStream(1, stateHalfClosedRemote)
 
@@ -394,11 +420,37 @@ func TestWriteResponseNoBody(t *testing.T) {
 	}
 }
 
+func TestWriteResponseAfterBroadcastErrorOnHalfClosedRemote(t *testing.T) {
+	var out bytes.Buffer
+	server := newTestServerSession(nil, &out)
+	server.conn = NewConn(nil, &out)
+	server.registerStream(1, stateHalfClosedRemote)
+
+	server.broadcastError(errors.New("http2: received GOAWAY"))
+
+	resp := core.AcquireResponse()
+	defer core.ReleaseResponse(resp)
+	resp.Version = core.VersionHTTP2
+	resp.Status = core.NewStatus(200)
+	resp.Headers.SetString("Content-Type", "text/plain")
+	resp.SetBody(io.NopCloser(bytes.NewReader([]byte("OK"))))
+
+	if err := server.WriteResponse(1, resp); err != nil {
+		t.Fatalf("write response after GOAWAY broadcast: %v", err)
+	}
+	if out.Len() == 0 {
+		t.Fatal("expected output bytes after GOAWAY broadcast")
+	}
+	if server.getStreamState(1) != nil {
+		t.Fatal("expected stream to be unregistered after response completes")
+	}
+}
+
 // --- WriteResponseHead returns nil for no-body ---
 
 func TestWriteResponseHeadNoBody(t *testing.T) {
 	var out bytes.Buffer
-	server := NewServerSession(nil, &out)
+	server := newTestServerSession(nil, &out)
 	server.conn = NewConn(nil, &out)
 	server.registerStream(1, stateHalfClosedRemote)
 
@@ -457,7 +509,7 @@ func TestRSTStreamFrameHandling(t *testing.T) {
 	frameBuf.Write(rstPayload)
 
 	var discard bytes.Buffer
-	server := NewServerSession(&frameBuf, &discard)
+	server := newTestServerSession(&frameBuf, &discard)
 
 	_, _, err = server.ReadRequest()
 	if err == nil {
@@ -468,7 +520,7 @@ func TestRSTStreamFrameHandling(t *testing.T) {
 // --- WINDOW_UPDATE parsing ---
 
 func TestWindowUpdateFrameParsing(t *testing.T) {
-	s := NewServerSession(nil, nil)
+	s := newTestServerSession(nil, nil)
 	ss := s.registerStream(1, stateOpen)
 	ss.sendWindow.Store(0) // Window exhausted.
 
@@ -488,7 +540,7 @@ func TestWindowUpdateFrameParsing(t *testing.T) {
 
 func TestConcurrentWriteResponse(t *testing.T) {
 	var out bytes.Buffer
-	server := NewServerSession(nil, &out)
+	server := newTestServerSession(nil, &out)
 	server.conn = NewConn(nil, &out)
 
 	const numStreams = 10
@@ -519,7 +571,7 @@ func TestConcurrentWriteResponse(t *testing.T) {
 // --- registerStream/unregisterStream ---
 
 func TestRegisterUnregisterStream(t *testing.T) {
-	s := NewServerSession(nil, nil)
+	s := newTestServerSession(nil, nil)
 
 	ss := s.registerStream(1, stateOpen)
 	if ss == nil {
@@ -542,7 +594,7 @@ func TestRegisterUnregisterStream(t *testing.T) {
 // --- transitionStreamClosed ---
 
 func TestTransitionStreamClosed(t *testing.T) {
-	s := NewServerSession(nil, nil)
+	s := newTestServerSession(nil, nil)
 
 	// Case 1: half-closed remote → closed.
 	ss := s.registerStream(1, stateHalfClosedRemote)
@@ -565,7 +617,7 @@ func TestTransitionStreamClosed(t *testing.T) {
 // --- dataCh capacity ---
 
 func TestDataChCapacity(t *testing.T) {
-	s := NewServerSession(nil, nil)
+	s := newTestServerSession(nil, nil)
 	ss := s.registerStream(1, stateOpen)
 	if cap(ss.dataCh) != dataChCapacity {
 		t.Fatalf("unexpected dataCh capacity %d, want %d", cap(ss.dataCh), dataChCapacity)
@@ -577,7 +629,7 @@ func TestDataChCapacity(t *testing.T) {
 func TestSendWindowInitialization(t *testing.T) {
 	settings := DefaultConnectionSettings()
 	settings.InitialWindowSize = 32768
-	s := NewServerSession(nil, nil)
+	s := newTestServerSession(nil, nil)
 	s.streams.PeerSettings.InitialWindowSize = 32768
 
 	ss := s.registerStream(1, stateOpen)
@@ -602,7 +654,7 @@ func TestConnSendWindowInit(t *testing.T) {
 
 func TestConcurrentWindowAccounting(t *testing.T) {
 	var out bytes.Buffer
-	server := NewServerSession(nil, &out)
+	server := newTestServerSession(nil, &out)
 	server.conn = NewConn(nil, &out)
 
 	// Small connection window to stress the CAS reservation.
@@ -710,7 +762,7 @@ func TestHeadersOnHalfClosedRemoteStream(t *testing.T) {
 	}
 
 	var discard bytes.Buffer
-	server := NewServerSession(&frameBuf, &discard)
+	server := newTestServerSession(&frameBuf, &discard)
 
 	// First ReadRequest should succeed (the initial HEADERS+END_STREAM).
 	_, gotReq, err := server.ReadRequest()
@@ -786,7 +838,7 @@ func TestMalformedTrailersReturnError(t *testing.T) {
 	frameBuf.Write(trailerPayload)
 
 	var discard bytes.Buffer
-	server := NewServerSession(&frameBuf, &discard)
+	server := newTestServerSession(&frameBuf, &discard)
 
 	_, _, err = server.ReadRequest()
 	if err == nil {

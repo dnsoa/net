@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"sync"
 	"sync/atomic"
@@ -236,7 +237,7 @@ func (w *streamWriter) Close() error {
 	} else if w.ss.state.CompareAndSwap(stateHalfClosedRemote, stateClosed) {
 		w.session.unregisterStream(w.streamID)
 	}
-	return nil
+	return w.session.Flush()
 }
 
 // Session manages an HTTP/2 connection with single-reader multi-writer concurrency.
@@ -259,17 +260,62 @@ type Session struct {
 	connSendWindow atomic.Int32
 	connRecvWindow atomic.Int32
 	connWindowCond *sync.Cond
+	goAwayReceived atomic.Bool
 
 	// Request dispatch channel
 	dispatchCh chan dispatchedRequest
 }
 
 // NewServerSession creates an HTTP/2 server-side session.
-func NewServerSession(reader io.Reader, writer io.Writer) *Session {
+// Sends the server connection preface (SETTINGS frame) and reads the
+// client connection preface (24-byte magic + SETTINGS frame).
+func NewServerSession(reader io.Reader, writer io.Writer) (*Session, error) {
 	conn := NewConn(reader, writer)
 	conn.IsClient = false
 	conn.NextStreamID = 2
-	return newSession(conn, false)
+
+	// RFC 7540 §3.3: Server connection preface — send SETTINGS frame.
+	payload := EncodeSettingsPayload(conn.Settings, nil)
+	if err := conn.WriteFrame(FrameHeader{Length: uint32(len(payload)), Type: FrameSettings, StreamID: 0}, payload); err != nil {
+		return nil, fmt.Errorf("http2 server preface write: %w", err)
+	}
+	// Flush SETTINGS to wire immediately.
+	if err := flushWriter(writer); err != nil {
+		return nil, fmt.Errorf("http2 server preface flush: %w", err)
+	}
+
+	// RFC 7540 §3.5: Read and validate client connection preface magic.
+	magic := make([]byte, len(Preface))
+	if _, err := io.ReadFull(reader, magic); err != nil {
+		return nil, fmt.Errorf("http2 client preface read: %w", err)
+	}
+	if string(magic) != Preface {
+		return nil, fmt.Errorf("http2 invalid client preface")
+	}
+
+	s := newSession(conn, false)
+
+	// Read the client's SETTINGS frame (first frame after preface).
+	frame, err := conn.ReadFrame(1<<20 + 1)
+	if err != nil {
+		return nil, fmt.Errorf("http2 client settings read: %w", err)
+	}
+	if frame.Header.Type != FrameSettings {
+		return nil, fmt.Errorf("http2 expected SETTINGS frame, got %d", frame.Header.Type)
+	}
+	if err := s.applyRemoteSettings(frame); err != nil {
+		return nil, fmt.Errorf("http2 client settings apply: %w", err)
+	}
+
+	return s, nil
+}
+
+// flushWriter flushes the writer if it implements Flusher.
+func flushWriter(w io.Writer) error {
+	if f, ok := w.(interface{ Flush() error }); ok {
+		return f.Flush()
+	}
+	return nil
 }
 
 func newSession(conn *Conn, isClient bool) *Session {
@@ -333,8 +379,10 @@ func (s *Session) handleFrame(frame Frame) {
 	case FramePing:
 		s.handlePingFrame(frame)
 	case FrameGoAway:
-		s.readLoopErr = errors.New("http2: received GOAWAY")
-		s.broadcastError(s.readLoopErr)
+		// RFC 7540 §6.8: GOAWAY means "no new streams", not "kill everything".
+		// Continue the readLoop to process WINDOW_UPDATE, PING, etc. for
+		// existing streams so the server can finish sending responses.
+		s.goAwayReceived.Store(true)
 	}
 }
 
@@ -582,7 +630,7 @@ func (s *Session) WriteResponse(streamID uint32, resp *core.Response) error {
 
 	if endStream {
 		s.transitionStreamClosed(streamID)
-		return nil
+		return s.Flush()
 	}
 
 	// Write body via streamWriter (flow-control compliant).
@@ -613,6 +661,7 @@ func (s *Session) WriteResponse(streamID uint32, resp *core.Response) error {
 		}
 		s.writeMu.Unlock()
 		s.transitionStreamClosed(streamID)
+		return s.Flush()
 	} else {
 		// Send END_STREAM via empty DATA frame.
 		ss := s.getStreamState(streamID)
@@ -688,6 +737,11 @@ func (s *Session) WriteResponseHead(streamID uint32, resp *core.Response) (*stre
 	}
 	s.writeMu.Unlock()
 
+	// Flush headers immediately so the client can start processing.
+	if err := s.Flush(); err != nil {
+		return nil, err
+	}
+
 	ss := s.getStreamState(streamID)
 	if ss == nil {
 		return nil, errStreamClosed
@@ -734,13 +788,13 @@ func (s *Session) getStreamState(id uint32) *streamState {
 func (s *Session) broadcastError(err error) {
 	s.streamMu.Lock()
 	for _, ss := range s.activeStreams {
-		ss.closed.Store(true)
 		// Skip streams that have already received END_STREAM (request data complete).
 		// Connection errors don't affect streams whose data is fully received.
 		state := ss.state.Load()
 		if state == stateHalfClosedRemote || state == stateClosed {
 			continue
 		}
+		ss.closed.Store(true)
 		select {
 		case ss.errCh <- err:
 		default:
@@ -819,5 +873,13 @@ func (s *Session) applyRemoteSettings(frame Frame) error {
 	s.streams.encoder.SetMaxDynamicTableSizeLimit(s.conn.PeerSettings.HeaderTableSize)
 	err := s.conn.WriteFrame(FrameHeader{Type: FrameSettings, Flags: FlagAck, StreamID: 0}, nil)
 	s.writeMu.Unlock()
-	return err
+	if err != nil {
+		return err
+	}
+	return s.Flush()
+}
+
+// Flush flushes any buffered write data to the underlying connection.
+func (s *Session) Flush() error {
+	return flushWriter(s.conn.writer)
 }

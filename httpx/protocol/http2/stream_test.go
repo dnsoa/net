@@ -239,3 +239,69 @@ func TestReceiveHeaderBlockFrameRejectsInterleaving(t *testing.T) {
 		t.Fatal("expected continuation stream mismatch to fail")
 	}
 }
+
+func TestDecodeMultipleHeaderBlocksWithDynamicTableSizeUpdate(t *testing.T) {
+	peer := DefaultConnectionSettings()
+	sender := NewStreamManager(true, DefaultConnectionSettings(), peer)
+	receiver := NewStreamManager(false, DefaultConnectionSettings(), DefaultConnectionSettings())
+
+	stream1, err := sender.OpenStream()
+	if err != nil {
+		t.Fatalf("open stream1: %v", err)
+	}
+	req1 := core.AcquireRequest()
+	defer core.ReleaseRequest(req1)
+	initRequest(req1, core.MethodGet, "https://example.com/one")
+	req1.Headers.SetString("x-trace-id", "one")
+	frames1, err := sender.BuildRequestHeaderFrames(stream1.ID, req1, true)
+	if err != nil {
+		t.Fatalf("build request1 headers: %v", err)
+	}
+	var decoded1 *DecodedHeaderBlock
+	for _, frame := range frames1 {
+		decoded1, err = receiver.ReceiveHeaderBlockFrame(frame)
+		if err != nil {
+			t.Fatalf("receive request1 header block: %v", err)
+		}
+	}
+	if decoded1 == nil {
+		t.Fatal("expected decoded first header block")
+	}
+
+	// Force a dynamic table size update at the beginning of the next header block.
+	sender.encoder.SetMaxDynamicTableSize(0)
+
+	stream2, err := sender.OpenStream()
+	if err != nil {
+		t.Fatalf("open stream2: %v", err)
+	}
+	req2 := core.AcquireRequest()
+	defer core.ReleaseRequest(req2)
+	initRequest(req2, core.MethodGet, "https://example.com/two")
+	req2.Headers.SetString("x-trace-id", "two")
+	frames2, err := sender.BuildRequestHeaderFrames(stream2.ID, req2, true)
+	if err != nil {
+		t.Fatalf("build request2 headers: %v", err)
+	}
+	var decoded2 *DecodedHeaderBlock
+	for _, frame := range frames2 {
+		decoded2, err = receiver.ReceiveHeaderBlockFrame(frame)
+		if err != nil {
+			t.Fatalf("receive request2 header block: %v", err)
+		}
+	}
+	if decoded2 == nil {
+		t.Fatal("expected decoded second header block")
+	}
+	decodedReq2, err := receiver.DecodeRequestHeaderBlock(decoded2.Fields)
+	if err != nil {
+		t.Fatalf("decode request2 header block: %v", err)
+	}
+	defer core.ReleaseRequest(decodedReq2)
+	if got := decodedReq2.Headers.Get("x-trace-id"); string(got) != "two" {
+		t.Fatalf("unexpected x-trace-id header %q", got)
+	}
+	if string(decodedReq2.URI.Path) != "/two" {
+		t.Fatalf("unexpected path %q", decodedReq2.URI.Path)
+	}
+}

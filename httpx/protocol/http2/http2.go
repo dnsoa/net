@@ -32,6 +32,8 @@ const (
 	FlagEndStream  uint8 = 0x1
 	FlagAck        uint8 = 0x1
 	FlagEndHeaders uint8 = 0x4
+	FlagPadded     uint8 = 0x8
+	FlagPriority   uint8 = 0x20
 )
 
 type FrameHeader struct {

@@ -157,10 +157,29 @@ func (m *StreamManager) ReceiveHeaderBlockFrame(frame Frame) (*DecodedHeaderBloc
 		if err := m.ApplyReceivedFrame(frame); err != nil {
 			return nil, err
 		}
+		// Strip PRIORITY and PADDED prefix per RFC 7540 §6.2.
+		payload := frame.Payload
+		if frame.Header.Flags&FlagPadded != 0 {
+			if len(payload) == 0 {
+				return nil, errors.New("http2 padded headers frame with empty payload")
+			}
+			padLen := int(payload[0])
+			payload = payload[1:]
+			if padLen > len(payload) {
+				return nil, errors.New("http2 headers frame padding exceeds payload")
+			}
+			payload = payload[:len(payload)-padLen]
+		}
+		if frame.Header.Flags&FlagPriority != 0 {
+			if len(payload) < 5 {
+				return nil, errors.New("http2 priority headers frame with short payload")
+			}
+			payload = payload[5:] // skip E(1bit)+StreamDependency(31bits)+Weight(8bits)
+		}
 		pending := &pendingHeaderBlock{
 			streamID:  frame.Header.StreamID,
 			endStream: frame.Header.Flags&FlagEndStream != 0,
-			payload:   append([]byte(nil), frame.Payload...),
+			payload:   append([]byte(nil), payload...),
 		}
 		if frame.Header.Flags&FlagEndHeaders != 0 {
 			return m.decodeHeaderBlock(pending)
@@ -406,15 +425,14 @@ func (m *StreamManager) buildHeaderBlockFrames(streamID uint32, block []byte, en
 }
 
 func (m *StreamManager) decodeHeaderBlock(pending *pendingHeaderBlock) (*DecodedHeaderBlock, error) {
-	m.decodedFields = m.decodedFields[:0]
-	if _, err := m.decoder.Write(pending.payload); err != nil {
+	fields, err := m.decoder.DecodeFull(pending.payload)
+	if err != nil {
 		return nil, err
 	}
-	fields := append([]hpack.HeaderField(nil), m.decodedFields...)
 	return &DecodedHeaderBlock{
 		StreamID:  pending.streamID,
 		EndStream: pending.endStream,
-		Fields:    fields,
+		Fields:    append([]hpack.HeaderField(nil), fields...),
 	}, nil
 }
 
