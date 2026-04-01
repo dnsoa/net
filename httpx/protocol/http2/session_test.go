@@ -9,6 +9,8 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/net/http2/hpack"
+
 	"github.com/dnsoa/net/httpx/core"
 )
 
@@ -19,6 +21,21 @@ func newTestServerSession(reader io.Reader, writer io.Writer) *Session {
 	conn.IsClient = false
 	conn.NextStreamID = 2
 	return newSession(conn, false)
+}
+
+func readTestFrames(t *testing.T, data []byte) []Frame {
+	t.Helper()
+	reader := bytes.NewReader(data)
+	conn := NewConn(reader, nil)
+	frames := make([]Frame, 0, 4)
+	for reader.Len() > 0 {
+		frame, err := conn.ReadFrame(1 << 20)
+		if err != nil {
+			t.Fatalf("read frame: %v", err)
+		}
+		frames = append(frames, frame)
+	}
+	return frames
 }
 
 // --- State transition tests (no I/O needed) ---
@@ -138,6 +155,135 @@ func TestStreamReaderFromDataCh(t *testing.T) {
 	}
 }
 
+func TestStreamReaderSendsConnectionWindowUpdate(t *testing.T) {
+	var written bytes.Buffer
+	s := newTestServerSession(nil, &written)
+	ss := s.registerStream(1, stateOpen)
+	body := bytes.Repeat([]byte("a"), 40000)
+
+	s.handleDataFrame(Frame{
+		Header: FrameHeader{
+			Length:   uint32(len(body)),
+			Type:     FrameData,
+			Flags:    FlagEndStream,
+			StreamID: 1,
+		},
+		Payload: body,
+	})
+
+	sr := &streamReader{
+		dataCh:            ss.dataCh,
+		errCh:             ss.errCh,
+		session:           s,
+		streamID:          1,
+		recvWindow:        65535,
+		initialWindowSize: 65535,
+		ss:                ss,
+	}
+
+	if _, err := io.Copy(io.Discard, sr); err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	if got := s.connRecvWindow.Load(); got != 65535 {
+		t.Fatalf("expected connection receive window to reset, got %d", got)
+	}
+
+	frames := readTestFrames(t, written.Bytes())
+	var sawStreamWindowUpdate bool
+	var sawConnWindowUpdate bool
+	for _, frame := range frames {
+		if frame.Header.Type != FrameWindowUpdate {
+			continue
+		}
+		switch frame.Header.StreamID {
+		case 0:
+			sawConnWindowUpdate = true
+		case 1:
+			sawStreamWindowUpdate = true
+		}
+	}
+	if !sawStreamWindowUpdate {
+		t.Fatal("expected stream WINDOW_UPDATE")
+	}
+	if !sawConnWindowUpdate {
+		t.Fatal("expected connection WINDOW_UPDATE")
+	}
+}
+
+func TestHandleDataFramePaddedStripsPadding(t *testing.T) {
+	s := newTestServerSession(nil, nil)
+	ss := s.registerStream(1, stateOpen)
+	payload := []byte{2, 'a', 'b', 'c', 0, 0}
+
+	s.handleDataFrame(Frame{
+		Header: FrameHeader{
+			Length:   uint32(len(payload)),
+			Type:     FrameData,
+			Flags:    FlagPadded | FlagEndStream,
+			StreamID: 1,
+		},
+		Payload: payload,
+	})
+
+	sr := &streamReader{
+		dataCh:            ss.dataCh,
+		errCh:             ss.errCh,
+		session:           s,
+		streamID:          1,
+		recvWindow:        65535,
+		initialWindowSize: 65535,
+		ss:                ss,
+	}
+
+	body, err := io.ReadAll(sr)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	if string(body) != "abc" {
+		t.Fatalf("unexpected body %q", string(body))
+	}
+	if s.readLoopErr != nil {
+		t.Fatalf("unexpected connection error: %v", s.readLoopErr)
+	}
+}
+
+func TestHandleDataFramePaddedRejectsInvalidPadding(t *testing.T) {
+	tests := []struct {
+		name    string
+		payload []byte
+	}{
+		{
+			name:    "empty payload",
+			payload: nil,
+		},
+		{
+			name:    "padding exceeds payload",
+			payload: []byte{4, 'a', 'b'},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := newTestServerSession(nil, nil)
+			s.registerStream(1, stateOpen)
+
+			s.handleDataFrame(Frame{
+				Header: FrameHeader{
+					Length:   uint32(len(tt.payload)),
+					Type:     FrameData,
+					Flags:    FlagPadded,
+					StreamID: 1,
+				},
+				Payload: tt.payload,
+			})
+
+			if s.readLoopErr == nil {
+				t.Fatal("expected connection error")
+			}
+		})
+	}
+}
+
 // --- streamReader error propagation ---
 
 func TestStreamReaderError(t *testing.T) {
@@ -159,6 +305,92 @@ func TestStreamReaderError(t *testing.T) {
 	_, err := sr.Read(buf)
 	if err != testErr {
 		t.Fatalf("expected testErr, got %v", err)
+	}
+}
+
+func TestHandleHeaderFrameRSTOnDecodeRequestError(t *testing.T) {
+	var written bytes.Buffer
+	s := newTestServerSession(nil, &written)
+
+	var block bytes.Buffer
+	enc := hpack.NewEncoder(&block)
+	for _, field := range []hpack.HeaderField{
+		{Name: ":scheme", Value: "https"},
+		{Name: ":authority", Value: "example.com"},
+		{Name: ":path", Value: "/"},
+	} {
+		if err := enc.WriteField(field); err != nil {
+			t.Fatalf("encode header field: %v", err)
+		}
+	}
+
+	s.handleHeaderFrame(Frame{
+		Header: FrameHeader{
+			Length:   uint32(block.Len()),
+			Type:     FrameHeaders,
+			Flags:    FlagEndHeaders | FlagEndStream,
+			StreamID: 1,
+		},
+		Payload: block.Bytes(),
+	})
+
+	if s.getStreamState(1) != nil {
+		t.Fatal("expected invalid request stream to remain unregistered")
+	}
+	frames := readTestFrames(t, written.Bytes())
+	if len(frames) != 1 {
+		t.Fatalf("expected 1 frame, got %d", len(frames))
+	}
+	if frames[0].Header.Type != FrameRSTStream {
+		t.Fatalf("expected RST_STREAM, got %v", frames[0].Header.Type)
+	}
+	if frames[0].Header.StreamID != 1 {
+		t.Fatalf("expected stream 1 reset, got %d", frames[0].Header.StreamID)
+	}
+}
+
+func TestHandleDataFrameUnknownStreamFailsConnection(t *testing.T) {
+	s := newTestServerSession(nil, nil)
+
+	s.handleDataFrame(Frame{
+		Header:  FrameHeader{Length: 1, Type: FrameData, StreamID: 1},
+		Payload: []byte{"x"[0]},
+	})
+
+	if s.readLoopErr == nil {
+		t.Fatal("expected connection error for unknown stream data")
+	}
+}
+
+func TestHandleWindowUpdateFrameRejectsInvalidPayload(t *testing.T) {
+	tests := []struct {
+		name  string
+		frame Frame
+	}{
+		{
+			name: "short payload",
+			frame: Frame{
+				Header:  FrameHeader{Length: 3, Type: FrameWindowUpdate, StreamID: 0},
+				Payload: []byte{0, 0, 1},
+			},
+		},
+		{
+			name: "zero increment",
+			frame: Frame{
+				Header:  FrameHeader{Length: 4, Type: FrameWindowUpdate, StreamID: 0},
+				Payload: []byte{0, 0, 0, 0},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := newTestServerSession(nil, nil)
+			s.handleWindowUpdateFrame(tt.frame)
+			if s.readLoopErr == nil {
+				t.Fatal("expected connection error")
+			}
+		})
 	}
 }
 

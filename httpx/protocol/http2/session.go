@@ -88,6 +88,7 @@ func (r *streamReader) Read(p []byte) (int, error) {
 			n := copy(p, r.buf[r.bufOff:])
 			r.bufOff += n
 			r.maybeSendWindowUpdate(n)
+			r.session.maybeSendConnWindowUpdate(n)
 			return n, nil
 		}
 		select {
@@ -260,6 +261,7 @@ type Session struct {
 	connSendWindow atomic.Int32
 	connRecvWindow atomic.Int32
 	connWindowCond *sync.Cond
+	connRecvMu     sync.Mutex
 	goAwayReceived atomic.Bool
 
 	// Request dispatch channel
@@ -389,8 +391,7 @@ func (s *Session) handleFrame(frame Frame) {
 func (s *Session) handleHeaderFrame(frame Frame) {
 	decoded, err := s.streams.ReceiveHeaderBlockFrame(frame)
 	if err != nil {
-		s.readLoopErr = err
-		s.broadcastError(err)
+		s.failConnection(err)
 		return
 	}
 	if decoded == nil {
@@ -439,6 +440,9 @@ func (s *Session) handleHeaderFrame(frame Frame) {
 
 	req, decodeErr := s.streams.DecodeRequestHeaderBlock(decoded.Fields)
 	if decodeErr != nil {
+		s.writeMu.Lock()
+		s.writeRSTStream(decoded.StreamID, ErrProtocolError)
+		s.writeMu.Unlock()
 		return
 	}
 
@@ -475,6 +479,7 @@ func (s *Session) handleHeaderFrame(frame Frame) {
 func (s *Session) handleDataFrame(frame Frame) {
 	ss := s.getStreamState(frame.Header.StreamID)
 	if ss == nil {
+		s.failConnection(errors.New("http2 data for unknown stream"))
 		return
 	}
 
@@ -487,10 +492,29 @@ func (s *Session) handleDataFrame(frame Frame) {
 		s.writeMu.Unlock()
 		return
 	}
+	payload := frame.Payload
+	if frame.Header.Flags&FlagPadded != 0 {
+		if len(payload) == 0 {
+			s.failConnection(errors.New("http2 padded data frame with empty payload"))
+			return
+		}
+		padLen := int(payload[0])
+		payload = payload[1:]
+		if padLen > len(payload) {
+			s.failConnection(errors.New("http2 data frame padding exceeds payload"))
+			return
+		}
+		payload = payload[:len(payload)-padLen]
+	}
+	if s.connRecvWindow.Add(-int32(len(frame.Payload))) < 0 {
+		ss.closed.Store(true)
+		s.failConnection(errDataOverflow)
+		return
+	}
 
 	// Non-blocking push to dataCh. No window replenishment here —
 	// WINDOW_UPDATE is driven by streamReader.Read() consumption.
-	payload := append([]byte(nil), frame.Payload...)
+	payload = append([]byte(nil), payload...)
 	select {
 	case ss.dataCh <- payload:
 	default:
@@ -515,6 +539,7 @@ func (s *Session) handleDataFrame(frame Frame) {
 
 func (s *Session) handleWindowUpdateFrame(frame Frame) {
 	if len(frame.Payload) != 4 {
+		s.failConnection(errors.New("http2 invalid window update length"))
 		return
 	}
 	increment := int32(uint32(frame.Payload[0]&0x7F)<<24 |
@@ -522,6 +547,7 @@ func (s *Session) handleWindowUpdateFrame(frame Frame) {
 		uint32(frame.Payload[2])<<8 |
 		uint32(frame.Payload[3]))
 	if increment <= 0 {
+		s.failConnection(errors.New("http2 invalid window increment"))
 		return
 	}
 	if frame.Header.StreamID == 0 {
@@ -550,8 +576,7 @@ func (s *Session) handleRSTStreamFrame(frame Frame) {
 
 func (s *Session) handleSettingsFrame(frame Frame) {
 	if err := s.applyRemoteSettings(frame); err != nil {
-		s.readLoopErr = err
-		s.broadcastError(err)
+		s.failConnection(err)
 	}
 }
 
@@ -801,6 +826,36 @@ func (s *Session) broadcastError(err error) {
 		}
 	}
 	s.streamMu.Unlock()
+}
+
+func (s *Session) failConnection(err error) {
+	if err == nil || s.readLoopErr != nil {
+		return
+	}
+	s.readLoopErr = err
+	s.broadcastError(err)
+}
+
+func (s *Session) maybeSendConnWindowUpdate(consumed int) {
+	if consumed <= 0 {
+		return
+	}
+	initialWindowSize := int32(s.streams.LocalSettings.InitialWindowSize)
+	if initialWindowSize <= 0 {
+		return
+	}
+
+	s.connRecvMu.Lock()
+	if s.connRecvWindow.Load() <= initialWindowSize/2 {
+		increment := initialWindowSize - s.connRecvWindow.Load()
+		s.connRecvWindow.Store(initialWindowSize)
+		s.connRecvMu.Unlock()
+		s.writeMu.Lock()
+		s.writeWindowUpdate(0, uint32(increment))
+		s.writeMu.Unlock()
+		return
+	}
+	s.connRecvMu.Unlock()
 }
 
 func (s *Session) writeRSTStream(streamID uint32, code ErrorCode) {
