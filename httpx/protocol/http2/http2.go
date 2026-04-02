@@ -112,7 +112,7 @@ type ConnectionSettings struct {
 func DefaultConnectionSettings() ConnectionSettings {
 	return ConnectionSettings{
 		HeaderTableSize:      4096,
-		EnablePush:           true,
+		EnablePush:           false,
 		MaxConcurrentStreams: 100,
 		InitialWindowSize:    65535,
 		MaxFrameSize:         16384,
