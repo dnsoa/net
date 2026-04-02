@@ -222,6 +222,83 @@ func (w *streamWriter) reserveWindow(remaining, maxFrame int) int {
 	}
 }
 
+// WriteFinal writes p as DATA frames with END_STREAM on the last frame, then flushes.
+// This ensures body data and END_STREAM are delivered in the same flush — the peer
+// never observes body data without END_STREAM, preventing "incomplete response" errors.
+// If p is empty, behaves like Close (sends empty END_STREAM frame).
+func (w *streamWriter) WriteFinal(p []byte) error {
+	if len(p) == 0 {
+		return w.Close()
+	}
+	if w.ss.closed.Load() {
+		return errStreamClosed
+	}
+
+	written := 0
+	for written < len(p) {
+		if w.ss.closed.Load() {
+			return errStreamClosed
+		}
+		for w.ss.sendWindow.Load() <= 0 {
+			w.ss.windowCond.L.Lock()
+			w.ss.windowCond.Wait()
+			w.ss.windowCond.L.Unlock()
+			if w.ss.closed.Load() {
+				return errStreamClosed
+			}
+		}
+		for w.session.connSendWindow.Load() <= 0 {
+			w.session.connWindowCond.L.Lock()
+			w.session.connWindowCond.Wait()
+			w.session.connWindowCond.L.Unlock()
+			if w.ss.closed.Load() {
+				return errStreamClosed
+			}
+		}
+
+		maxFrame := int(w.session.streams.PeerSettings.MaxFrameSize)
+		if maxFrame <= 0 {
+			maxFrame = 16384
+		}
+
+		chunk := w.reserveWindow(len(p)-written, maxFrame)
+		if chunk <= 0 {
+			continue
+		}
+
+		isLast := written+chunk == len(p)
+		flags := uint8(0)
+		if isLast {
+			flags = FlagEndStream
+		}
+
+		w.session.writeMu.Lock()
+		err := w.session.conn.WriteFrame(FrameHeader{
+			Length:   uint32(chunk),
+			Type:     FrameData,
+			Flags:    flags,
+			StreamID: w.streamID,
+		}, p[written:written+chunk])
+		w.session.writeMu.Unlock()
+		if err != nil {
+			w.ss.sendWindow.Add(int32(chunk))
+			w.session.connSendWindow.Add(int32(chunk))
+			return err
+		}
+		written += chunk
+	}
+
+	if w.ss.state.CompareAndSwap(stateOpen, stateHalfClosedLocal) {
+		// open → half-closed (local)
+	} else if w.ss.state.CompareAndSwap(stateHalfClosedRemote, stateClosed) {
+		w.session.unregisterStream(w.streamID)
+	}
+	return w.session.Flush()
+}
+
+// Close sends an empty DATA frame with END_STREAM and flushes.
+// For streaming responses, prefer WriteFinal which combines the last body
+// chunk with END_STREAM in a single frame.
 func (w *streamWriter) Close() error {
 	w.session.writeMu.Lock()
 	err := w.session.conn.WriteFrame(FrameHeader{
@@ -328,7 +405,7 @@ func newSession(conn *Conn, isClient bool) *Session {
 		streams:          NewStreamManager(isClient, conn.Settings, conn.PeerSettings),
 		maxReadFrameSize: int(conn.PeerSettings.MaxFrameSize),
 		activeStreams:    make(map[uint32]*streamState),
-		dispatchCh:       make(chan dispatchedRequest, 16),
+		dispatchCh:       make(chan dispatchedRequest, 4096),
 	}
 	s.connSendWindow.Store(initWindow)
 	s.connRecvWindow.Store(localInitWindow)
@@ -356,7 +433,16 @@ func (s *Session) readLoop() {
 		frame, err := s.readFrame()
 		if err != nil {
 			s.readLoopErr = err
-			s.broadcastError(err)
+			// RFC 7540 §6.8: GOAWAY means "no new streams", not "kill everything".
+			// After GOAWAY, EOF is the expected end of the session — do NOT
+			// broadcastError to active streams.  This allows handler goroutines
+			// to attempt writing responses.  If the TCP write-side is still open
+			// (peer half-closed with FIN), the response will be delivered.
+			// If the connection is fully reset, the write will fail naturally
+			// with a broken-pipe / connection-reset error.
+			if !s.goAwayReceived.Load() {
+				s.broadcastError(err)
+			}
 			return
 		}
 		s.handleFrame(frame)
