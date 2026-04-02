@@ -445,14 +445,30 @@ func isQpackTruncatedError(err error) bool {
 
 func (c *QpackCodec) EncodeRequest(req *core.Request) ([]byte, error) {
 	fields := make([]HeaderField, 0, req.Headers.Count()+4)
-	fields = append(fields,
-		HeaderField{Name: ":method", Value: req.Method.String()},
-		HeaderField{Name: ":scheme", Value: http3RequestScheme(req)},
-		HeaderField{Name: ":authority", Value: http3RequestAuthority(req)},
-		HeaderField{Name: ":path", Value: string(req.URI.RequestTarget(nil))},
-	)
+	fields = append(fields, HeaderField{Name: ":method", Value: req.Method.String()})
+	scheme := http3RequestScheme(req)
+	authority := http3RequestAuthority(req)
+	if req.Method == core.MethodConnect {
+		if authority == "" {
+			return nil, errors.New("http3 CONNECT request missing authority")
+		}
+		fields = append(fields, HeaderField{Name: ":authority", Value: authority})
+	} else {
+		path := http3RequestPath(req)
+		fields = append(fields, HeaderField{Name: ":scheme", Value: scheme})
+		if authority != "" {
+			fields = append(fields, HeaderField{Name: ":authority", Value: authority})
+		}
+		fields = append(fields, HeaderField{Name: ":path", Value: path})
+	}
 	for _, entry := range req.Headers.Entries() {
 		name := strings.ToLower(string(entry.Name))
+		if strings.HasPrefix(name, ":") {
+			return nil, errors.New("http3 request headers must not include pseudo headers")
+		}
+		if name == "host" {
+			continue
+		}
 		if shouldSkipHTTP3Header(name) {
 			continue
 		}
@@ -466,6 +482,9 @@ func (c *QpackCodec) EncodeResponse(resp *core.Response) ([]byte, error) {
 	fields = append(fields, HeaderField{Name: ":status", Value: strconv.Itoa(resp.Status.Code)})
 	for _, entry := range resp.Headers.Entries() {
 		name := strings.ToLower(string(entry.Name))
+		if strings.HasPrefix(name, ":") {
+			return nil, errors.New("http3 response headers must not include pseudo headers")
+		}
 		if shouldSkipHTTP3Header(name) {
 			continue
 		}
@@ -478,6 +497,9 @@ func (c *QpackCodec) EncodeTrailers(trailers *core.Headers) ([]byte, error) {
 	fields := make([]HeaderField, 0, trailers.Count())
 	for _, entry := range trailers.Entries() {
 		name := strings.ToLower(string(entry.Name))
+		if strings.HasPrefix(name, ":") {
+			return nil, errors.New("http3 trailers must not include pseudo headers")
+		}
 		if shouldSkipHTTP3Header(name) {
 			return nil, errors.New("http3 trailers contain disallowed header")
 		}
@@ -507,21 +529,79 @@ func buildRequestFromFields(fields []HeaderField) (*core.Request, error) {
 	var scheme string
 	var authority string
 	var path string
+	seenRegular := false
+	seenMethod := false
+	seenScheme := false
+	seenAuthority := false
+	seenPath := false
 	req := core.AcquireRequest()
 	req.Version = core.VersionHTTP3
 	for _, field := range fields {
+		if err := validateHTTP3Field(field.Name, field.Value, strings.HasPrefix(field.Name, ":")); err != nil {
+			core.ReleaseRequest(req)
+			return nil, err
+		}
+		if strings.HasPrefix(field.Name, ":") {
+			if seenRegular {
+				core.ReleaseRequest(req)
+				return nil, errors.New("http3 request pseudo headers must appear before regular headers")
+			}
+		} else {
+			seenRegular = true
+		}
 		switch field.Name {
 		case ":method":
+			if seenMethod {
+				core.ReleaseRequest(req)
+				return nil, errors.New("http3 duplicate request pseudo header")
+			}
+			seenMethod = true
 			method = field.Value
 		case ":scheme":
+			if seenScheme {
+				core.ReleaseRequest(req)
+				return nil, errors.New("http3 duplicate request pseudo header")
+			}
+			seenScheme = true
 			scheme = field.Value
 		case ":authority":
+			if seenAuthority {
+				core.ReleaseRequest(req)
+				return nil, errors.New("http3 duplicate request pseudo header")
+			}
+			seenAuthority = true
 			authority = field.Value
 		case ":path":
+			if seenPath {
+				core.ReleaseRequest(req)
+				return nil, errors.New("http3 duplicate request pseudo header")
+			}
+			seenPath = true
 			path = field.Value
+		case ":protocol":
+			core.ReleaseRequest(req)
+			return nil, errors.New("http3 extended CONNECT is not supported")
 		default:
+			if strings.HasPrefix(field.Name, ":") {
+				core.ReleaseRequest(req)
+				return nil, errors.New("http3 request contains unknown pseudo header")
+			}
+			if err := validateHTTP3RequestHeader(field.Name, field.Value); err != nil {
+				continue
+			}
+			if equalFoldASCII(field.Name, "host") {
+				req.Headers.AppendString(field.Name, field.Value)
+				continue
+			}
+			if shouldSkipHTTP3Header(field.Name) {
+				continue
+			}
 			req.Headers.AppendString(field.Name, field.Value)
 		}
+	}
+	if method == "" {
+		core.ReleaseRequest(req)
+		return nil, errors.New("http3 request missing :method")
 	}
 	parsedMethod, ok := core.ParseMethodBytes([]byte(method))
 	if !ok {
@@ -529,11 +609,36 @@ func buildRequestFromFields(fields []HeaderField) (*core.Request, error) {
 		return nil, errors.New("http3 unsupported request method")
 	}
 	req.Method = parsedMethod
-	if path == "" {
-		path = "/"
+	if parsedMethod == core.MethodConnect {
+		if authority == "" {
+			core.ReleaseRequest(req)
+			return nil, errors.New("http3 CONNECT request missing :authority")
+		}
+		if scheme != "" || path != "" {
+			core.ReleaseRequest(req)
+			return nil, errors.New("http3 CONNECT request must not include :scheme or :path")
+		}
+		if err := req.URI.ParseString(authority); err != nil {
+			core.ReleaseRequest(req)
+			return nil, err
+		}
+		if req.Headers.Get("Host") == nil {
+			req.Headers.Set(core.HeaderHost, []byte(authority))
+		}
+		if err := validateContentLengthHeaders(req.Headers); err != nil {
+			req.Headers.RemoveAllString("Content-Length")
+		}
+		return req, nil
 	}
-	if scheme == "" {
-		scheme = "https"
+	if scheme == "" || path == "" {
+		core.ReleaseRequest(req)
+		return nil, errors.New("http3 request missing required pseudo headers")
+	}
+	if strings.EqualFold(scheme, "http") || strings.EqualFold(scheme, "https") {
+		host := req.Headers.Get("Host")
+		if authority == "" && len(host) > 0 {
+			authority = string(host)
+		}
 	}
 	uri := path
 	if authority != "" {
@@ -545,6 +650,9 @@ func buildRequestFromFields(fields []HeaderField) (*core.Request, error) {
 	}
 	if authority != "" && req.Headers.Get("Host") == nil {
 		req.Headers.Set(core.HeaderHost, []byte(authority))
+	}
+	if err := validateContentLengthHeaders(req.Headers); err != nil {
+		req.Headers.RemoveAllString("Content-Length")
 	}
 	return req, nil
 }
@@ -566,19 +674,64 @@ func (c *QpackCodec) decodeResponse(block []byte, streamID *uint64) (*core.Respo
 }
 
 func buildResponseFromFields(fields []HeaderField) (*core.Response, error) {
+	status := ""
+	seenStatus := false
+	seenRegular := false
 	resp := core.AcquireResponse()
 	resp.Version = core.VersionHTTP3
 	for _, field := range fields {
-		if field.Name == ":status" {
-			code, err := strconv.Atoi(field.Value)
-			if err != nil {
-				core.ReleaseResponse(resp)
-				return nil, errors.New("http3 invalid status")
-			}
-			resp.Status = core.NewStatus(code)
-			continue
+		if err := validateHTTP3Field(field.Name, field.Value, strings.HasPrefix(field.Name, ":")); err != nil {
+			core.ReleaseResponse(resp)
+			return nil, err
 		}
-		resp.Headers.AppendString(field.Name, field.Value)
+		if strings.HasPrefix(field.Name, ":") {
+			if seenRegular {
+				core.ReleaseResponse(resp)
+				return nil, errors.New("http3 response pseudo headers must appear before regular headers")
+			}
+		} else {
+			seenRegular = true
+		}
+		switch field.Name {
+		case ":status":
+			if seenStatus {
+				core.ReleaseResponse(resp)
+				return nil, errors.New("http3 duplicate response pseudo header")
+			}
+			seenStatus = true
+			status = field.Value
+		case "":
+			core.ReleaseResponse(resp)
+			return nil, errors.New("http3 invalid response header name")
+		default:
+			if strings.HasPrefix(field.Name, ":") {
+				core.ReleaseResponse(resp)
+				return nil, errors.New("http3 response contains unknown pseudo header")
+			}
+			if equalFoldASCII(field.Name, "te") {
+				core.ReleaseResponse(resp)
+				return nil, errors.New("http3 response must not contain TE header")
+			}
+			if shouldSkipHTTP3Header(field.Name) {
+				core.ReleaseResponse(resp)
+				return nil, errors.New("http3 response contains connection-specific header")
+			}
+			resp.Headers.AppendString(field.Name, field.Value)
+		}
+	}
+	if !seenStatus {
+		core.ReleaseResponse(resp)
+		return nil, errors.New("http3 response missing :status")
+	}
+	code, err := strconv.Atoi(status)
+	if err != nil || code < 100 || code > 999 || code == 101 {
+		core.ReleaseResponse(resp)
+		return nil, errors.New("http3 invalid status")
+	}
+	resp.Status = core.NewStatus(code)
+	if err := validateContentLengthHeaders(resp.Headers); err != nil {
+		core.ReleaseResponse(resp)
+		return nil, err
 	}
 	return resp, nil
 }
@@ -602,13 +755,95 @@ func (c *QpackCodec) decodeTrailers(block []byte, streamID *uint64) (core.Header
 func buildTrailersFromFields(fields []HeaderField) (core.Headers, error) {
 	trailers := core.NewHeaders()
 	for _, field := range fields {
+		if err := validateHTTP3Field(field.Name, field.Value, strings.HasPrefix(field.Name, ":")); err != nil {
+			trailers.Reset()
+			return core.Headers{}, err
+		}
 		if strings.HasPrefix(field.Name, ":") {
 			trailers.Reset()
 			return core.Headers{}, errors.New("http3 trailers must not contain pseudo headers")
 		}
+		if shouldSkipHTTP3Header(field.Name) {
+			trailers.Reset()
+			return core.Headers{}, errors.New("http3 trailers contain disallowed header")
+		}
 		trailers.AppendString(field.Name, field.Value)
 	}
 	return trailers, nil
+}
+
+func validateHTTP3Field(name, value string, pseudo bool) error {
+	if name == "" {
+		return errors.New("http3 invalid header name")
+	}
+	for index := 0; index < len(name); index++ {
+		ch := name[index]
+		if ch >= 'A' && ch <= 'Z' {
+			return errors.New("http3 field name must be lowercase")
+		}
+		if pseudo && index == 0 && ch == ':' {
+			continue
+		}
+		if ch <= 0x20 || ch >= 0x7f {
+			return errors.New("http3 invalid header name")
+		}
+	}
+	for index := 0; index < len(value); index++ {
+		switch value[index] {
+		case '\r', '\n', 0:
+			return errors.New("http3 invalid header value")
+		}
+	}
+	return nil
+}
+
+func validateHTTP3RequestHeader(name, value string) error {
+	if equalFoldASCII(name, "te") && !equalFoldASCII(value, "trailers") {
+		return errors.New("http3 request TE header must be trailers")
+	}
+	return nil
+}
+
+func validateContentLengthHeaders(headers core.Headers) error {
+	values := headers.GetAll("Content-Length")
+	if len(values) == 0 {
+		return nil
+	}
+	canonical := -1
+	for _, raw := range values {
+		parsed, err := strconv.Atoi(string(raw))
+		if err != nil || parsed < 0 {
+			return errors.New("http3 invalid content-length header")
+		}
+		if canonical == -1 {
+			canonical = parsed
+			continue
+		}
+		if parsed != canonical {
+			return errors.New("http3 conflicting content-length headers")
+		}
+	}
+	return nil
+}
+
+func equalFoldASCII(left, right string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := 0; index < len(left); index++ {
+		l := left[index]
+		r := right[index]
+		if l >= 'A' && l <= 'Z' {
+			l += 0x20
+		}
+		if r >= 'A' && r <= 'Z' {
+			r += 0x20
+		}
+		if l != r {
+			return false
+		}
+	}
+	return true
 }
 
 func (c *QpackCodec) EncodeFields(fields []HeaderField) ([]byte, error) {
@@ -959,9 +1194,17 @@ func http3RequestAuthority(req *core.Request) string {
 	return authority
 }
 
+func http3RequestPath(req *core.Request) string {
+	path := string(req.URI.RequestTarget(nil))
+	if path == "" {
+		return "/"
+	}
+	return path
+}
+
 func shouldSkipHTTP3Header(name string) bool {
 	switch name {
-	case "connection", "proxy-connection", "keep-alive", "transfer-encoding", "upgrade", "host":
+	case "connection", "proxy-connection", "keep-alive", "transfer-encoding", "upgrade":
 		return true
 	default:
 		return false

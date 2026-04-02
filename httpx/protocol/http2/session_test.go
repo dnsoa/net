@@ -912,7 +912,7 @@ func TestConcurrentWindowAccounting(t *testing.T) {
 		go func(w *streamWriter) {
 			defer wg.Done()
 			n, err := w.Write(body)
-			if err != nil && err != errStreamClosed {
+			if err != nil && err != ErrStreamClosedWrite {
 				t.Errorf("write error: %v", err)
 			}
 			writtenCh <- n

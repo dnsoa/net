@@ -13,6 +13,10 @@ import (
 
 const maxTrailerLineBytes = 8 * 1024
 
+// ErrMessageIncomplete is returned when the HTTP/1.x parser reaches EOF
+// before the message is complete (e.g. client disconnects mid-request).
+var ErrMessageIncomplete = errors.New("http1 message incomplete")
+
 type Conn struct {
 	reader         io.Reader
 	writer         io.Writer
@@ -84,17 +88,36 @@ func (c *Conn) WriteRequest(req *core.Request) error {
 	if c.writer == nil {
 		return errors.New("http1 writer is nil")
 	}
-	body, err := req.ReadAll()
-	if err != nil {
+	c.keepAlive = req.Headers.IsKeepAlive(req.Version)
+
+	// Ensure Content-Length header is present when body exists
+	if req.Body != nil && req.ContentLength > 0 {
+		ensureRequestContentLength(req, int(req.ContentLength))
+	}
+
+	// Write request line + headers (no body)
+	if cap(c.writeBuf) < 512 {
+		c.writeBuf = make([]byte, 0, 512)
+	}
+	dst := append(c.writeBuf[:0], req.Method.String()...)
+	dst = append(dst, ' ')
+	dst = req.URI.RequestTarget(dst)
+	dst = append(dst, ' ')
+	dst = append(dst, req.Version.String()...)
+	dst = append(dst, '\r', '\n')
+	dst = req.Headers.Serialize(dst)
+	dst = append(dst, '\r', '\n')
+	if _, err := c.writer.Write(dst); err != nil {
 		return err
 	}
-	c.keepAlive = req.Headers.IsKeepAlive(req.Version)
-	if cap(c.writeBuf) < 512+len(body) {
-		c.writeBuf = make([]byte, 0, 512+len(body))
+
+	// Stream body if present
+	if req.Body != nil {
+		if _, err := io.Copy(c.writer, req.Body); err != nil {
+			return err
+		}
 	}
-	c.writeBuf = FormatRequest(req, body, c.writeBuf[:0])
-	_, err = c.writer.Write(c.writeBuf)
-	return err
+	return nil
 }
 
 func (c *Conn) WriteResponse(resp *core.Response) error {
@@ -191,6 +214,13 @@ func (c *Conn) ReadStreamResponse() (*core.Response, io.Reader, error) {
 	}
 
 	rootprotocol.ReleaseParser(p)
+
+	// RFC 7230 §3.3: responses with status codes 1xx, 204, and 304
+	// MUST NOT have a body. Return an empty reader immediately to avoid
+	// blocking on a keep-alive connection waiting for EOF that never comes.
+	if !resp.Status.MayHaveBody() {
+		return resp, bytes.NewReader(nil), nil
+	}
 
 	var bodyReader io.Reader = bytes.NewReader(bufferedBody)
 	if contentLength > len(bufferedBody) {
@@ -365,7 +395,7 @@ func (c *Conn) readMessage(mode rootprotocol.ParserMode) (any, error) {
 	}
 
 	if !p.Complete() {
-		return nil, errors.New("http1 message incomplete")
+		return nil, ErrMessageIncomplete
 	}
 
 	if mode == rootprotocol.ParserModeRequest {

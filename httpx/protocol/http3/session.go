@@ -10,6 +10,8 @@ import (
 	"github.com/dnsoa/net/httpx/core"
 )
 
+const responseBodyReadBufferSize = 32 * 1024
+
 const (
 	SettingQPACKMaxTableCapacity uint64 = 0x01
 	SettingMaxFieldSectionSize   uint64 = 0x06
@@ -22,14 +24,18 @@ type Session struct {
 	IsClient         bool
 	Settings         Settings
 	PeerSettings     Settings
+	peerGoAwayID     uint64
+	peerMaxPushID    uint64
 	qpack            *QpackCodec
 	settingsSent     bool
 	settingsReceived bool
+	peerGoAwaySeen   bool
+	peerMaxPushSet   bool
 	encoderWriteInit bool
 	encoderReadInit  bool
+	encoderReadBuf   []byte
 	decoderWriteInit bool
 	decoderReadInit  bool
-	encoderReadBuf   []byte
 	decoderReadBuf   []byte
 }
 
@@ -394,8 +400,46 @@ func (s *Session) ReadControlStream(r io.Reader) error {
 			}
 			return err
 		}
-		if FrameType(frame.Header.Type) == FrameSettings {
+		frameType := FrameType(frame.Header.Type)
+		if frameType == FrameSettings {
 			return errors.New("http3 control stream must not contain duplicate settings")
+		}
+		if s.isUnexpectedControlFrame(frameType) {
+			return errors.New("http3 unexpected frame type on control stream")
+		}
+		switch frameType {
+		case FrameGoAway:
+			id, err := decodeSingleVarIntPayload(frame.Payload)
+			if err != nil {
+				return err
+			}
+			if err := s.validatePeerGoAwayID(id); err != nil {
+				return err
+			}
+			s.peerGoAwayID = id
+			s.peerGoAwaySeen = true
+		case FrameMaxPushID:
+			id, err := decodeSingleVarIntPayload(frame.Payload)
+			if err != nil {
+				return err
+			}
+			if err := s.validatePeerMaxPushID(id); err != nil {
+				return err
+			}
+			s.peerMaxPushID = id
+			s.peerMaxPushSet = true
+		case FrameCancelPush:
+			id, err := decodeSingleVarIntPayload(frame.Payload)
+			if err != nil {
+				return err
+			}
+			if err := s.validatePeerCancelPushID(id); err != nil {
+				return err
+			}
+		default:
+			if isReservedHTTP2FrameType(frameType) {
+				return errors.New("http3 reserved frame type on control stream")
+			}
 		}
 	}
 }
@@ -420,7 +464,7 @@ func (s *Session) WriteEncoderStream(w io.Writer) error {
 }
 
 func (s *Session) ReadEncoderStream(r io.Reader) error {
-	chunk, err := readQPACKChunk(r)
+	chunk, ended, err := readQPACKChunk(r)
 	if err != nil {
 		return err
 	}
@@ -447,6 +491,9 @@ func (s *Session) ReadEncoderStream(r io.Reader) error {
 		return err
 	}
 	s.encoderReadBuf = discardConsumedPrefix(s.encoderReadBuf, consumed)
+	if ended && len(s.encoderReadBuf) > 0 {
+		return errors.New("http3 truncated qpack encoder stream")
+	}
 	return nil
 }
 
@@ -470,7 +517,7 @@ func (s *Session) WriteDecoderStream(w io.Writer) error {
 }
 
 func (s *Session) ReadDecoderStream(r io.Reader) error {
-	chunk, err := readQPACKChunk(r)
+	chunk, ended, err := readQPACKChunk(r)
 	if err != nil {
 		return err
 	}
@@ -497,12 +544,18 @@ func (s *Session) ReadDecoderStream(r io.Reader) error {
 		return err
 	}
 	s.decoderReadBuf = discardConsumedPrefix(s.decoderReadBuf, consumed)
+	if ended && len(s.decoderReadBuf) > 0 {
+		return errors.New("http3 truncated qpack decoder stream")
+	}
 	return nil
 }
 
 func (s *Session) WriteRequest(w io.Writer, req *core.Request) error {
 	if !s.settingsSent {
 		return errors.New("http3 settings not sent")
+	}
+	if req == nil {
+		return errors.New("http3 request is nil")
 	}
 	headersBlock, err := s.qpack.EncodeRequest(req)
 	if err != nil {
@@ -513,8 +566,14 @@ func (s *Session) WriteRequest(w io.Writer, req *core.Request) error {
 	}
 	var body []byte
 	if req.Body != nil {
-		body, _ = io.ReadAll(req.Body)
+		body, err = io.ReadAll(req.Body)
 		req.Body.Close()
+		if err != nil {
+			return err
+		}
+	}
+	if err := validateMessageContentLength(req.Headers, len(body), true); err != nil {
+		req.Headers.RemoveAllString("Content-Length")
 	}
 	if len(body) > 0 {
 		if err := writeFrame(w, FrameData, body); err != nil {
@@ -522,6 +581,9 @@ func (s *Session) WriteRequest(w io.Writer, req *core.Request) error {
 		}
 	}
 	if req.Trailers.Count() > 0 {
+		if isConnectTunnelRequest(req) {
+			return errors.New("http3 CONNECT request must not contain trailer sections")
+		}
 		trailerBlock, err := s.qpack.EncodeTrailers(&req.Trailers)
 		if err != nil {
 			return err
@@ -552,6 +614,12 @@ func (s *Session) WriteResponse(w io.Writer, resp *core.Response) error {
 	if !s.settingsSent {
 		return errors.New("http3 settings not sent")
 	}
+	if resp == nil {
+		return errors.New("http3 response is nil")
+	}
+	if resp.Status.Code >= 100 && resp.Status.Code < 200 {
+		return errors.New("http3 informational responses require a separate response sequence")
+	}
 	headersBlock, err := s.qpack.EncodeResponse(resp)
 	if err != nil {
 		return err
@@ -559,15 +627,12 @@ func (s *Session) WriteResponse(w io.Writer, resp *core.Response) error {
 	if err := writeFrame(w, FrameHeaders, headersBlock); err != nil {
 		return err
 	}
-	var body []byte
-	if resp.Body != nil {
-		body, _ = io.ReadAll(resp.Body)
-		resp.Body.Close()
+	bodyLen, err := s.writeResponseBodyFrames(w, resp)
+	if err != nil {
+		return err
 	}
-	if len(body) > 0 && resp.Status.MayHaveBody() {
-		if err := writeFrame(w, FrameData, body); err != nil {
-			return err
-		}
+	if err := validateMessageContentLength(resp.Headers, bodyLen, resp.Status.MayHaveBody()); err != nil {
+		return err
 	}
 	if resp.Trailers.Count() > 0 {
 		trailerBlock, err := s.qpack.EncodeTrailers(&resp.Trailers)
@@ -579,6 +644,35 @@ func (s *Session) WriteResponse(w io.Writer, resp *core.Response) error {
 		}
 	}
 	return nil
+}
+
+func (s *Session) writeResponseBodyFrames(w io.Writer, resp *core.Response) (int, error) {
+	if resp == nil || resp.Body == nil {
+		return 0, nil
+	}
+	defer resp.Body.Close()
+	bufPtr := core.DefaultAllocator().Get(responseBodyReadBufferSize)
+	defer core.DefaultAllocator().Put(bufPtr)
+	buf := (*bufPtr)[:responseBodyReadBufferSize]
+	total := 0
+	for {
+		n, err := resp.Body.Read(buf)
+		if n > 0 {
+			total += n
+			if !resp.Status.MayHaveBody() {
+				return total, errors.New("http3 response status must not include a body")
+			}
+			if err := writeFrame(w, FrameData, buf[:n]); err != nil {
+				return total, err
+			}
+		}
+		if errors.Is(err, io.EOF) {
+			return total, nil
+		}
+		if err != nil {
+			return total, err
+		}
+	}
 }
 
 func (s *Session) ReadResponse(r io.Reader) (*core.Response, error) {
@@ -633,6 +727,7 @@ func EncodeSettings(settings Settings, dst []byte) ([]byte, error) {
 
 func DecodeSettings(payload []byte) (Settings, error) {
 	var settings Settings
+	seen := make(map[uint64]struct{})
 	offset := 0
 	for offset < len(payload) {
 		id, n, err := DecodeVarInt(payload[offset:])
@@ -645,7 +740,13 @@ func DecodeSettings(payload []byte) (Settings, error) {
 			return Settings{}, err
 		}
 		offset += n
+		if _, ok := seen[id]; ok {
+			return Settings{}, errors.New("http3 duplicate settings parameter")
+		}
+		seen[id] = struct{}{}
 		switch id {
+		case 0x00, 0x02, 0x03, 0x04, 0x05:
+			return Settings{}, errors.New("http3 reserved settings parameter")
 		case SettingQPACKMaxTableCapacity:
 			settings.QPACKMaxTableCap = value
 		case SettingMaxFieldSectionSize:
@@ -653,8 +754,14 @@ func DecodeSettings(payload []byte) (Settings, error) {
 		case SettingQPACKBlockedStreams:
 			settings.QPACKBlockedStreams = value
 		case SettingEnableConnectProtocol:
+			if value > 1 {
+				return Settings{}, errors.New("http3 enable_connect_protocol setting must be 0 or 1")
+			}
 			settings.EnableConnectProto = value != 0
 		case SettingH3Datagram:
+			if value > 1 {
+				return Settings{}, errors.New("http3 h3_datagram setting must be 0 or 1")
+			}
 			settings.EnableDatagrams = value != 0
 		}
 	}
@@ -692,12 +799,98 @@ func appendBody(dst, chunk []byte) []byte {
 	return append(dst, chunk...)
 }
 
-func isInvalidMessageFrame(frameType FrameType) bool {
+func validateMessageContentLength(headers core.Headers, bodyLen int, validateZeroBody bool) error {
+	contentLength, ok := headers.ContentLength()
+	if !ok {
+		return nil
+	}
+	if !validateZeroBody {
+		return nil
+	}
+	if contentLength != bodyLen {
+		return errors.New("http3 content-length does not match DATA frame length")
+	}
+	return nil
+}
+
+func isConnectTunnelRequest(req *core.Request) bool {
+	return req != nil && req.Method == core.MethodConnect
+}
+
+func isConnectTunnelResponse(resp *core.Response) bool {
+	return resp != nil && resp.Status.Code >= 200 && resp.Status.Code < 300
+}
+
+func (s *Session) validatePeerGoAwayID(id uint64) error {
+	if s.IsClient && id%4 != 0 {
+		return errors.New("http3 goaway stream id has invalid type")
+	}
+	if s.peerGoAwaySeen && id > s.peerGoAwayID {
+		return errors.New("http3 goaway id increased")
+	}
+	return nil
+}
+
+func (s *Session) validatePeerMaxPushID(id uint64) error {
+	if s.peerMaxPushSet && id < s.peerMaxPushID {
+		return errors.New("http3 max push id decreased")
+	}
+	return nil
+}
+
+func (s *Session) validatePeerCancelPushID(id uint64) error {
+	if s.peerMaxPushSet && id > s.peerMaxPushID {
+		return errors.New("http3 cancel push id exceeds limit")
+	}
+	return errors.New("http3 cancel push without promised push")
+}
+
+func (s *Session) isUnexpectedControlFrame(frameType FrameType) bool {
 	switch frameType {
-	case FrameCancelPush, FrameSettings, FrameGoAway, FrameMaxPushID:
+	case FrameData, FrameHeaders, FramePushPromise:
+		return true
+	case FrameMaxPushID:
+		return s.IsClient
+	default:
+		return false
+	}
+}
+func isReservedHTTP2FrameType(frameType FrameType) bool {
+	switch frameType {
+	case 0x02, 0x06, 0x08, 0x09:
 		return true
 	default:
 		return false
+	}
+}
+
+func isInvalidMessageFrame(frameType FrameType) bool {
+	switch frameType {
+	case FrameCancelPush, FrameSettings, FramePushPromise, FrameGoAway, FrameMaxPushID:
+		return true
+	default:
+		return isReservedHTTP2FrameType(frameType)
+	}
+}
+
+func readResponseHeaders(s *Session, r io.Reader, streamID *uint64) (*core.Response, error) {
+	for {
+		frame, err := readNextFrame(r)
+		if err != nil {
+			return nil, err
+		}
+		if FrameType(frame.Header.Type) != FrameHeaders {
+			return nil, errors.New("http3 response stream missing headers")
+		}
+		resp, err := s.qpack.decodeResponse(frame.Payload, streamID)
+		if err != nil {
+			return nil, err
+		}
+		if resp.Status.Code >= 100 && resp.Status.Code < 200 {
+			core.ReleaseResponse(resp)
+			continue
+		}
+		return resp, nil
 	}
 }
 
@@ -720,6 +913,9 @@ func (s *Session) readRequestOrResponse(r io.Reader, isRequest bool, streamID *u
 			frame, err := readNextFrame(r)
 			if err != nil {
 				if errors.Is(err, io.EOF) {
+					if err := validateMessageContentLength(req.Headers, len(bodyData), true); err != nil {
+						req.Headers.RemoveAllString("Content-Length")
+					}
 					req.Body = io.NopCloser(bytes.NewReader(bodyData))
 					req.ContentLength = int64(len(bodyData))
 					return req, nil
@@ -736,6 +932,10 @@ func (s *Session) readRequestOrResponse(r io.Reader, isRequest bool, streamID *u
 				}
 				bodyData = appendBody(bodyData, frame.Payload)
 			case FrameHeaders:
+				if isConnectTunnelRequest(req) {
+					core.ReleaseRequest(req)
+					return nil, errors.New("http3 CONNECT request must not contain trailer sections")
+				}
 				if seenTrailers {
 					core.ReleaseRequest(req)
 					return nil, errors.New("http3 message stream must not contain multiple trailer sections")
@@ -759,12 +959,23 @@ func (s *Session) readRequestOrResponse(r io.Reader, isRequest bool, streamID *u
 	if err != nil {
 		return nil, err
 	}
+	if resp.Status.Code >= 100 && resp.Status.Code < 200 {
+		core.ReleaseResponse(resp)
+		resp, err = readResponseHeaders(s, r, streamID)
+		if err != nil {
+			return nil, err
+		}
+	}
 	var bodyData []byte
 	seenTrailers := false
 	for {
 		frame, err := readNextFrame(r)
 		if err != nil {
 			if errors.Is(err, io.EOF) {
+				if err := validateMessageContentLength(resp.Headers, len(bodyData), resp.Status.MayHaveBody()); err != nil {
+					core.ReleaseResponse(resp)
+					return nil, err
+				}
 				resp.Body = io.NopCloser(bytes.NewReader(bodyData))
 				resp.ContentLength = int64(len(bodyData))
 				return resp, nil
@@ -775,6 +986,10 @@ func (s *Session) readRequestOrResponse(r io.Reader, isRequest bool, streamID *u
 		frameType := FrameType(frame.Header.Type)
 		switch frameType {
 		case FrameData:
+			if !resp.Status.MayHaveBody() {
+				core.ReleaseResponse(resp)
+				return nil, errors.New("http3 response must not contain data for this status")
+			}
 			if seenTrailers {
 				core.ReleaseResponse(resp)
 				return nil, errors.New("http3 message stream must not contain data after trailers")
@@ -793,6 +1008,14 @@ func (s *Session) readRequestOrResponse(r io.Reader, isRequest bool, streamID *u
 			resp.Trailers = trailers
 			seenTrailers = true
 		default:
+			if isConnectTunnelResponse(resp) {
+				if isInvalidMessageFrame(frameType) {
+					core.ReleaseResponse(resp)
+					return nil, errors.New("http3 CONNECT response contains invalid frame type")
+				}
+				core.ReleaseResponse(resp)
+				return nil, errors.New("http3 CONNECT response must not contain non-DATA frames after success")
+			}
 			if isInvalidMessageFrame(frameType) {
 				core.ReleaseResponse(resp)
 				return nil, errors.New("http3 message stream contains invalid frame type")

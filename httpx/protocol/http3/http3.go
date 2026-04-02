@@ -25,6 +25,7 @@ type Settings struct {
 type ErrorCode uint64
 
 const (
+	ErrFlowControl          ErrorCode = 0x03
 	ErrNoError              ErrorCode = 0x100
 	ErrGeneralProtocolError ErrorCode = 0x101
 	ErrInternalError        ErrorCode = 0x102

@@ -33,7 +33,7 @@ func (s Status) IsError() bool {
 }
 
 func (s Status) MayHaveBody() bool {
-	return s.Code != 204 && s.Code != 304 && !(s.Code >= 100 && s.Code < 200)
+	return s.Code != 204 && s.Code != 304 && (s.Code < 100 || s.Code >= 200)
 }
 
 func ReasonPhrase(code int) string {

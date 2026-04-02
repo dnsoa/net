@@ -22,15 +22,18 @@ const (
 
 // dataChCapacity is the hard upper limit for per-stream dataCh buffer.
 // Default: ceil(65535/16384) + 1 = 5, hard cap 8 (don't trust peer SETTINGS).
-const dataChCapacity = 8
+const (
+	dataChCapacity     = 8    // ceil(65535/16384)+1 per-stream data buffer
+	dispatchChCapacity = 4096 // readLoop dispatch queue — large enough for browser bursts
+)
 
 var (
-	// errStreamClosed is returned when writing to a closed stream.
-	errStreamClosed = errors.New("http2: stream closed")
-	// errStreamReset is returned when the peer sends RST_STREAM.
-	errStreamReset = errors.New("http2: stream reset by peer")
-	// errDataOverflow is returned on dataCh overflow (flow control violation).
-	errDataOverflow = errors.New("http2: flow control error")
+	// ErrStreamClosedWrite is returned when writing to a closed stream.
+	ErrStreamClosedWrite = errors.New("http2: stream closed")
+	// ErrStreamReset is returned when the peer sends RST_STREAM.
+	ErrStreamReset = errors.New("http2: stream reset by peer")
+	// ErrDataOverflow is returned on dataCh overflow (flow control violation).
+	ErrDataOverflow = errors.New("http2: flow control error")
 )
 
 // streamState tracks per-stream concurrent state for the single-reader multi-writer model.
@@ -134,12 +137,12 @@ type streamWriter struct {
 
 func (w *streamWriter) Write(p []byte) (int, error) {
 	if w.ss.closed.Load() {
-		return 0, errStreamClosed
+		return 0, ErrStreamClosedWrite
 	}
 	written := 0
 	for written < len(p) {
 		if w.ss.closed.Load() {
-			return written, errStreamClosed
+			return written, ErrStreamClosedWrite
 		}
 
 		// Wait for stream-level send window.
@@ -148,7 +151,7 @@ func (w *streamWriter) Write(p []byte) (int, error) {
 			w.ss.windowCond.Wait()
 			w.ss.windowCond.L.Unlock()
 			if w.ss.closed.Load() {
-				return written, errStreamClosed
+				return written, ErrStreamClosedWrite
 			}
 		}
 
@@ -158,7 +161,7 @@ func (w *streamWriter) Write(p []byte) (int, error) {
 			w.session.connWindowCond.Wait()
 			w.session.connWindowCond.L.Unlock()
 			if w.ss.closed.Load() {
-				return written, errStreamClosed
+				return written, ErrStreamClosedWrite
 			}
 		}
 
@@ -191,6 +194,11 @@ func (w *streamWriter) Write(p []byte) (int, error) {
 
 		written += chunk
 	}
+
+	// Flush buffered DATA frames so the peer receives data without waiting
+	// for the buffer to fill. This is critical for CDN progressive loading.
+	_ = w.session.Flush()
+
 	return written, nil
 }
 
@@ -231,20 +239,20 @@ func (w *streamWriter) WriteFinal(p []byte) error {
 		return w.Close()
 	}
 	if w.ss.closed.Load() {
-		return errStreamClosed
+		return ErrStreamClosedWrite
 	}
 
 	written := 0
 	for written < len(p) {
 		if w.ss.closed.Load() {
-			return errStreamClosed
+			return ErrStreamClosedWrite
 		}
 		for w.ss.sendWindow.Load() <= 0 {
 			w.ss.windowCond.L.Lock()
 			w.ss.windowCond.Wait()
 			w.ss.windowCond.L.Unlock()
 			if w.ss.closed.Load() {
-				return errStreamClosed
+				return ErrStreamClosedWrite
 			}
 		}
 		for w.session.connSendWindow.Load() <= 0 {
@@ -252,7 +260,7 @@ func (w *streamWriter) WriteFinal(p []byte) error {
 			w.session.connWindowCond.Wait()
 			w.session.connWindowCond.L.Unlock()
 			if w.ss.closed.Load() {
-				return errStreamClosed
+				return ErrStreamClosedWrite
 			}
 		}
 
@@ -403,9 +411,9 @@ func newSession(conn *Conn, isClient bool) *Session {
 	s := &Session{
 		conn:             conn,
 		streams:          NewStreamManager(isClient, conn.Settings, conn.PeerSettings),
-		maxReadFrameSize: int(conn.PeerSettings.MaxFrameSize),
+		maxReadFrameSize: int(conn.Settings.MaxFrameSize),
 		activeStreams:    make(map[uint32]*streamState),
-		dispatchCh:       make(chan dispatchedRequest, 4096),
+		dispatchCh:       make(chan dispatchedRequest, dispatchChCapacity),
 	}
 	s.connSendWindow.Store(initWindow)
 	s.connRecvWindow.Store(localInitWindow)
@@ -446,6 +454,7 @@ func (s *Session) readLoop() {
 			return
 		}
 		s.handleFrame(frame)
+		frame.Release()
 		if s.readLoopErr != nil {
 			return
 		}
@@ -471,6 +480,12 @@ func (s *Session) handleFrame(frame Frame) {
 		// Continue the readLoop to process WINDOW_UPDATE, PING, etc. for
 		// existing streams so the server can finish sending responses.
 		s.goAwayReceived.Store(true)
+	case FramePriority:
+		// RFC 7540 §5.3: PRIORITY frames are 5 bytes. Servers may ignore
+		// the priority signal but MUST validate the frame length.
+		if len(frame.Payload) != 5 {
+			s.failConnection(errors.New("http2 invalid priority frame length"))
+		}
 	}
 }
 
@@ -594,7 +609,7 @@ func (s *Session) handleDataFrame(frame Frame) {
 	}
 	if s.connRecvWindow.Add(-int32(len(frame.Payload))) < 0 {
 		ss.closed.Store(true)
-		s.failConnection(errDataOverflow)
+		s.failConnection(ErrDataOverflow)
 		return
 	}
 
@@ -653,7 +668,7 @@ func (s *Session) handleRSTStreamFrame(frame Frame) {
 	if ss != nil {
 		ss.closed.Store(true)
 		select {
-		case ss.errCh <- errStreamReset:
+		case ss.errCh <- ErrStreamReset:
 		default:
 		}
 		s.unregisterStream(ss.id)
@@ -748,7 +763,7 @@ func (s *Session) WriteResponse(streamID uint32, resp *core.Response) error {
 	if len(body) > 0 && resp.Status.MayHaveBody() {
 		ss := s.getStreamState(streamID)
 		if ss == nil {
-			return errStreamClosed
+			return ErrStreamClosedWrite
 		}
 		w := &streamWriter{session: s, streamID: streamID, ss: ss}
 		if _, err := w.Write(body); err != nil {
@@ -777,7 +792,7 @@ func (s *Session) WriteResponse(streamID uint32, resp *core.Response) error {
 		// Send END_STREAM via empty DATA frame.
 		ss := s.getStreamState(streamID)
 		if ss == nil {
-			return errStreamClosed
+			return ErrStreamClosedWrite
 		}
 		w := &streamWriter{session: s, streamID: streamID, ss: ss}
 		if err := w.Close(); err != nil {
@@ -855,7 +870,7 @@ func (s *Session) WriteResponseHead(streamID uint32, resp *core.Response) (*stre
 
 	ss := s.getStreamState(streamID)
 	if ss == nil {
-		return nil, errStreamClosed
+		return nil, ErrStreamClosedWrite
 	}
 	if endStream {
 		s.transitionStreamClosed(streamID)
@@ -993,9 +1008,6 @@ func (s *Session) applyRemoteSettings(frame Frame) error {
 		return err
 	}
 	s.streams.PeerSettings = s.conn.PeerSettings
-	if size := int(s.conn.PeerSettings.MaxFrameSize); size > 0 {
-		s.maxReadFrameSize = size
-	}
 
 	// RFC 7540 §6.9.2: SETTINGS_INITIAL_WINDOW_SIZE delta applies to all
 	// active streams. A decrease can cause the send window to go negative.
@@ -1023,4 +1035,48 @@ func (s *Session) applyRemoteSettings(frame Frame) error {
 // Flush flushes any buffered write data to the underlying connection.
 func (s *Session) Flush() error {
 	return flushWriter(s.conn.writer)
+}
+
+// LastStreamID returns the highest peer-initiated stream ID seen by this session.
+func (s *Session) LastStreamID() uint32 {
+	s.streamMu.Lock()
+	defer s.streamMu.Unlock()
+	var maxID uint32
+	for id := range s.activeStreams {
+		if id > maxID {
+			maxID = id
+		}
+	}
+	return maxID
+}
+
+// SendGoAway sends a GOAWAY frame to the peer (RFC 7540 §6.8).
+// After this call the peer should not open new streams on this connection.
+func (s *Session) SendGoAway(lastStreamID uint32, code ErrorCode) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	payload := make([]byte, 8)
+	payload[0] = byte((lastStreamID >> 24) & 0x7F)
+	payload[1] = byte((lastStreamID >> 16) & 0xFF)
+	payload[2] = byte((lastStreamID >> 8) & 0xFF)
+	payload[3] = byte(lastStreamID & 0xFF)
+	binary.BigEndian.PutUint32(payload[4:8], uint32(code))
+	if err := s.conn.WriteFrame(FrameHeader{
+		Length:   8,
+		Type:     FrameGoAway,
+		StreamID: 0,
+	}, payload); err != nil {
+		return err
+	}
+	return s.Flush()
+}
+
+// Close gracefully shuts down the session: sends GOAWAY and waits for
+// the readLoop to exit.
+func (s *Session) Close() error {
+	_ = s.SendGoAway(s.LastStreamID(), ErrNoError)
+	if s.readLoopDone != nil {
+		<-s.readLoopDone
+	}
+	return nil
 }

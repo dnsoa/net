@@ -1,6 +1,10 @@
 package http3
 
 import (
+	"bytes"
+	"context"
+	"io"
+	"strconv"
 	"testing"
 
 	"github.com/dnsoa/net/httpx/core"
@@ -247,5 +251,130 @@ func BenchmarkDecodeQpackString(b *testing.B) {
 		for _, input := range inputs {
 			_, _, _ = decodeQpackString(input)
 		}
+	}
+}
+
+func BenchmarkServerConnStreamingRequestBodyLarge(b *testing.B) {
+	for _, tc := range []struct {
+		name      string
+		bodySize  int
+		chunkSize int
+	}{
+		{name: "64KB", bodySize: 64 << 10, chunkSize: 16 << 10},
+		{name: "1MB", bodySize: 1 << 20, chunkSize: 16 << 10},
+	} {
+		b.Run(tc.name, func(b *testing.B) {
+			client := NewClientSession()
+			client.settingsSent = true
+
+			body := bytes.Repeat([]byte("a"), tc.bodySize)
+			req := core.AcquireRequest()
+			initRequest(req, core.MethodPost, "https://cdn.example.com/upload")
+			req.Headers.Set(core.HeaderContentLength, []byte(strconv.Itoa(tc.bodySize)))
+			req.Body = io.NopCloser(bytes.NewReader(body))
+			req.ContentLength = int64(tc.bodySize)
+
+			var encoded bytes.Buffer
+			if err := client.WriteRequest(&encoded, req); err != nil {
+				b.Fatalf("encode request: %v", err)
+			}
+			core.ReleaseRequest(req)
+
+			headersFrame, consumed, err := DecodeFrameHeader(encoded.Bytes())
+			if err != nil {
+				b.Fatalf("decode headers frame: %v", err)
+			}
+			headersEnd := consumed + int(headersFrame.Length)
+
+			b.SetBytes(int64(tc.bodySize))
+			b.ReportAllocs()
+			b.ResetTimer()
+
+			for i := 0; i < b.N; i++ {
+				server := NewServerSession()
+				server.settingsSent = true
+				server.settingsReceived = true
+				streams := NewMemoryStreamOpenerFactory().NewStreamOpener()
+				conn := NewServerConn(server, streams)
+				conn.state.PeerSettingsReady = true
+
+				done := make(chan error, 1)
+				handler := ServerRequestHandlerFunc(func(ctx context.Context, got *core.Request) (*core.Response, error) {
+					_, err := io.Copy(io.Discard, got.Body)
+					done <- err
+					resp := core.AcquireResponse()
+					resp.Status = core.NewStatus(204)
+					return resp, nil
+				})
+
+				if err := conn.handleRequestStream(context.Background(), applicationPacket{StreamID: 0, IsStreamFrame: true, Payload: encoded.Bytes()[:headersEnd]}, handler); err != nil {
+					b.Fatalf("handle headers packet: %v", err)
+				}
+
+				offset := headersEnd
+				bodyBytes := encoded.Bytes()[headersEnd:]
+				for len(bodyBytes) > 0 {
+					chunkLen := tc.chunkSize
+					if chunkLen > len(bodyBytes) {
+						chunkLen = len(bodyBytes)
+					}
+					chunk := bodyBytes[:chunkLen]
+					bodyBytes = bodyBytes[chunkLen:]
+					packet := applicationPacket{
+						StreamID:      0,
+						IsStreamFrame: true,
+						StreamOffset:  uint64(offset),
+						Payload:       chunk,
+						Fin:           len(bodyBytes) == 0,
+					}
+					if err := conn.handleRequestStream(context.Background(), packet, handler); err != nil {
+						b.Fatalf("handle body packet: %v", err)
+					}
+					offset += chunkLen
+				}
+
+				if err := <-done; err != nil {
+					b.Fatalf("streaming body read: %v", err)
+				}
+				for !conn.isRequestStreamComplete(0) {
+				}
+			}
+		})
+	}
+}
+
+func BenchmarkServerConnPendingControlStreamFlush(b *testing.B) {
+	for _, tc := range []struct {
+		name             string
+		extraPayloadSize int
+	}{
+		{name: "4KB", extraPayloadSize: 4 << 10},
+		{name: "64KB", extraPayloadSize: 64 << 10},
+	} {
+		b.Run(tc.name, func(b *testing.B) {
+			pendingFrame, prefixFrame, err := buildPendingControlStreamFrames(tc.extraPayloadSize)
+			if err != nil {
+				b.Fatalf("build pending control frames: %v", err)
+			}
+			b.SetBytes(int64(len(pendingFrame) + len(prefixFrame)))
+			b.ReportAllocs()
+			b.ResetTimer()
+
+			for i := 0; i < b.N; i++ {
+				server := NewServerSession()
+				streams := NewMemoryStreamOpenerFactory().NewStreamOpener()
+				conn := NewServerConn(server, streams)
+
+				if _, err := conn.HandlePacket(context.Background(), pendingFrame, nil); err != nil {
+					b.Fatalf("handle pending control packet: %v", err)
+				}
+				if _, err := conn.HandlePacket(context.Background(), prefixFrame, nil); err != nil {
+					b.Fatalf("handle control prefix packet: %v", err)
+				}
+				if !conn.state.PeerSettingsReady {
+					b.Fatal("expected peer settings to be ready after flush")
+				}
+			}
+		})
 	}
 }

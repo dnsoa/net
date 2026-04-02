@@ -4,6 +4,9 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+
+	"github.com/dnsoa/go/allocator"
+	"github.com/dnsoa/net/httpx/core"
 )
 
 const (
@@ -160,8 +163,18 @@ func ApplySettingsPayload(settings *ConnectionSettings, payload []byte) error {
 }
 
 type Frame struct {
-	Header  FrameHeader
-	Payload []byte
+	Header   FrameHeader
+	Payload  []byte
+	allocBuf *allocator.Buffer // nil if not pool-allocated
+}
+
+// Release returns the payload buffer to the allocator.
+func (f *Frame) Release() {
+	if f.allocBuf != nil {
+		core.DefaultAllocator().Put(f.allocBuf)
+		f.allocBuf = nil
+		f.Payload = nil
+	}
 }
 
 type Conn struct {
@@ -208,13 +221,18 @@ func (c *Conn) ReadFrame(maxPayloadSize int) (Frame, error) {
 	if maxPayloadSize > 0 && int(header.Length) > maxPayloadSize {
 		return Frame{}, errors.New("http2 frame too large")
 	}
-	payload := make([]byte, header.Length)
+	var frame Frame
 	if header.Length > 0 {
-		if _, err := io.ReadFull(c.reader, payload); err != nil {
+		buf := core.DefaultAllocator().Get(int(header.Length))
+		frame = Frame{Header: header, Payload: (*buf)[:header.Length], allocBuf: buf}
+		if _, err := io.ReadFull(c.reader, frame.Payload); err != nil {
+			core.DefaultAllocator().Put(buf)
 			return Frame{}, err
 		}
+	} else {
+		frame = Frame{Header: header}
 	}
-	return Frame{Header: header, Payload: payload}, nil
+	return frame, nil
 }
 
 func (c *Conn) WriteFrame(header FrameHeader, payload []byte) error {

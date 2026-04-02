@@ -1,6 +1,6 @@
 module github.com/dnsoa/net/httpx
 
-go 1.25.6
+go 1.26.1
 
 require (
 	github.com/dnsoa/go/allocator v0.0.0

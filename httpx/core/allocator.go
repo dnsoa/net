@@ -22,6 +22,12 @@ func SetDefaultAllocator(a *allocator.Allocator) {
 	defaultAlloc = a
 }
 
+// DefaultAllocator returns the package-level allocator shared by core objects.
+// If SetDefaultAllocator was never called, a default allocator is lazily created.
+func DefaultAllocator() *allocator.Allocator {
+	return getDefaultAllocator()
+}
+
 // getDefaultAllocator returns the package-level allocator.
 // If SetDefaultAllocator was never called, a default allocator is lazily created.
 func getDefaultAllocator() *allocator.Allocator {
