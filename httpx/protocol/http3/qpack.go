@@ -7,6 +7,8 @@ import (
 	"strings"
 	"sync"
 
+	"golang.org/x/net/http2/hpack"
+
 	"github.com/dnsoa/net/httpx/core"
 )
 
@@ -279,6 +281,17 @@ func (c *QpackCodec) DrainDecoderInstructions() []byte {
 func (c *QpackCodec) ApplyEncoderInstructions(data []byte) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	_, err := c.consumeEncoderInstructionsLocked(data, false)
+	return err
+}
+
+func (c *QpackCodec) consumeEncoderInstructions(data []byte) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.consumeEncoderInstructionsLocked(data, true)
+}
+
+func (c *QpackCodec) consumeEncoderInstructionsLocked(data []byte, allowPartial bool) (int, error) {
 	startInsertCount := c.remoteTable.insertCount
 	offset := 0
 	for offset < len(data) {
@@ -288,73 +301,101 @@ func (c *QpackCodec) ApplyEncoderInstructions(data []byte) error {
 			isStatic := first&0x40 != 0
 			index, consumed, err := decodePrefixedInt(data[offset:], 6)
 			if err != nil {
-				return err
+				if allowPartial && isQpackTruncatedError(err) {
+					goto done
+				}
+				return offset, err
 			}
-			offset += consumed
-			value, read, err := decodeQpackString(data[offset:])
+			value, read, err := decodeQpackString(data[offset+consumed:])
 			if err != nil {
-				return err
+				if allowPartial && isQpackTruncatedError(err) {
+					goto done
+				}
+				return offset, err
 			}
-			offset += read
 			var name string
 			if isStatic {
 				if int(index) >= len(qpackStaticTable) {
-					return errors.New("http3 qpack static name index out of range")
+					return offset, errors.New("http3 qpack static name index out of range")
 				}
 				name = qpackStaticTable[index].name
 			} else {
 				entry, ok := c.remoteTable.getRelative(index)
 				if !ok {
-					return errors.New("http3 qpack dynamic name index out of range")
+					return offset, errors.New("http3 qpack dynamic name index out of range")
 				}
 				name = entry.name
 			}
 			c.remoteTable.insert(name, value)
+			offset += consumed + read
 		case first&0x40 != 0:
-			offset++
-			name, read, err := decodeQpackString(data[offset:])
+			name, read, err := decodeQpackStringWithPrefix(data[offset:], 5)
 			if err != nil {
-				return err
+				if allowPartial && isQpackTruncatedError(err) {
+					goto done
+				}
+				return offset, err
 			}
-			offset += read
-			value, read, err := decodeQpackString(data[offset:])
+			value, valueRead, err := decodeQpackString(data[offset+read:])
 			if err != nil {
-				return err
+				if allowPartial && isQpackTruncatedError(err) {
+					goto done
+				}
+				return offset, err
 			}
-			offset += read
 			c.remoteTable.insert(name, value)
+			offset += read + valueRead
 		case first&0x20 != 0:
 			capacity, consumed, err := decodePrefixedInt(data[offset:], 5)
 			if err != nil {
-				return err
+				if allowPartial && isQpackTruncatedError(err) {
+					goto done
+				}
+				return offset, err
 			}
 			offset += consumed
 			c.remoteTable.setMaxSize(capacity)
 		case first&0xE0 == 0x00:
 			index, consumed, err := decodePrefixedInt(data[offset:], 5)
 			if err != nil {
-				return err
+				if allowPartial && isQpackTruncatedError(err) {
+					goto done
+				}
+				return offset, err
 			}
-			offset += consumed
 			entry, ok := c.remoteTable.getRelative(index)
 			if !ok {
-				return errors.New("http3 qpack duplicate index out of range")
+				return offset, errors.New("http3 qpack duplicate index out of range")
 			}
 			c.remoteTable.insert(entry.name, entry.value)
+			offset += consumed
 		default:
-			return errors.New("http3 unsupported qpack encoder instruction")
+			return offset, errors.New("http3 unsupported qpack encoder instruction")
 		}
 	}
+
+done:
 	if c.remoteTable.insertCount > startInsertCount && c.remoteTable.insertCount > c.decoderAckCount {
 		c.pendingDecoder = appendPrefixedInt(c.pendingDecoder, 6, 0x00, c.remoteTable.insertCount-c.decoderAckCount)
 		c.decoderAckCount = c.remoteTable.insertCount
 	}
-	return nil
+	return offset, nil
 }
 
 func (c *QpackCodec) ApplyDecoderInstructions(data []byte) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	_, err := c.consumeDecoderInstructionsLocked(data, false)
+	return err
+}
+
+func (c *QpackCodec) consumeDecoderInstructions(data []byte) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.consumeDecoderInstructionsLocked(data, true)
+}
+
+func (c *QpackCodec) consumeDecoderInstructionsLocked(data []byte, allowPartial bool) (int, error) {
 	offset := 0
 	for offset < len(data) {
 		first := data[offset]
@@ -362,19 +403,28 @@ func (c *QpackCodec) ApplyDecoderInstructions(data []byte) error {
 		case first&0x80 != 0:
 			_, consumed, err := decodePrefixedInt(data[offset:], 7)
 			if err != nil {
-				return err
+				if allowPartial && isQpackTruncatedError(err) {
+					return offset, nil
+				}
+				return offset, err
 			}
 			offset += consumed
 		case first&0x40 != 0:
 			_, consumed, err := decodePrefixedInt(data[offset:], 6)
 			if err != nil {
-				return err
+				if allowPartial && isQpackTruncatedError(err) {
+					return offset, nil
+				}
+				return offset, err
 			}
 			offset += consumed
 		default:
 			increment, consumed, err := decodePrefixedInt(data[offset:], 6)
 			if err != nil {
-				return err
+				if allowPartial && isQpackTruncatedError(err) {
+					return offset, nil
+				}
+				return offset, err
 			}
 			offset += consumed
 			c.knownReceivedCount += increment
@@ -383,7 +433,14 @@ func (c *QpackCodec) ApplyDecoderInstructions(data []byte) error {
 			}
 		}
 	}
-	return nil
+	return offset, nil
+}
+
+func isQpackTruncatedError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(err.Error(), "truncated")
 }
 
 func (c *QpackCodec) EncodeRequest(req *core.Request) ([]byte, error) {
@@ -430,10 +487,22 @@ func (c *QpackCodec) EncodeTrailers(trailers *core.Headers) ([]byte, error) {
 }
 
 func (c *QpackCodec) DecodeRequest(block []byte) (*core.Request, error) {
-	fields, err := c.DecodeFields(block)
+	fields, err := c.decodeFields(block, nil)
 	if err != nil {
 		return nil, err
 	}
+	return buildRequestFromFields(fields)
+}
+
+func (c *QpackCodec) decodeRequest(block []byte, streamID *uint64) (*core.Request, error) {
+	fields, err := c.decodeFields(block, streamID)
+	if err != nil {
+		return nil, err
+	}
+	return buildRequestFromFields(fields)
+}
+
+func buildRequestFromFields(fields []HeaderField) (*core.Request, error) {
 	var method string
 	var scheme string
 	var authority string
@@ -481,10 +550,22 @@ func (c *QpackCodec) DecodeRequest(block []byte) (*core.Request, error) {
 }
 
 func (c *QpackCodec) DecodeResponse(block []byte) (*core.Response, error) {
-	fields, err := c.DecodeFields(block)
+	fields, err := c.decodeFields(block, nil)
 	if err != nil {
 		return nil, err
 	}
+	return buildResponseFromFields(fields)
+}
+
+func (c *QpackCodec) decodeResponse(block []byte, streamID *uint64) (*core.Response, error) {
+	fields, err := c.decodeFields(block, streamID)
+	if err != nil {
+		return nil, err
+	}
+	return buildResponseFromFields(fields)
+}
+
+func buildResponseFromFields(fields []HeaderField) (*core.Response, error) {
 	resp := core.AcquireResponse()
 	resp.Version = core.VersionHTTP3
 	for _, field := range fields {
@@ -503,10 +584,22 @@ func (c *QpackCodec) DecodeResponse(block []byte) (*core.Response, error) {
 }
 
 func (c *QpackCodec) DecodeTrailers(block []byte) (core.Headers, error) {
-	fields, err := c.DecodeFields(block)
+	fields, err := c.decodeFields(block, nil)
 	if err != nil {
 		return core.Headers{}, err
 	}
+	return buildTrailersFromFields(fields)
+}
+
+func (c *QpackCodec) decodeTrailers(block []byte, streamID *uint64) (core.Headers, error) {
+	fields, err := c.decodeFields(block, streamID)
+	if err != nil {
+		return core.Headers{}, err
+	}
+	return buildTrailersFromFields(fields)
+}
+
+func buildTrailersFromFields(fields []HeaderField) (core.Headers, error) {
 	trailers := core.NewHeaders()
 	for _, field := range fields {
 		if strings.HasPrefix(field.Name, ":") {
@@ -559,6 +652,10 @@ func (c *QpackCodec) EncodeFields(fields []HeaderField) ([]byte, error) {
 }
 
 func (c *QpackCodec) DecodeFields(data []byte) ([]HeaderField, error) {
+	return c.decodeFields(data, nil)
+}
+
+func (c *QpackCodec) decodeFields(data []byte, streamID *uint64) ([]HeaderField, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if len(data) < 2 {
@@ -571,12 +668,13 @@ func (c *QpackCodec) DecodeFields(data []byte) ([]HeaderField, error) {
 	if len(data[n:]) == 0 {
 		return nil, errors.New("http3 invalid qpack base")
 	}
+	deltaBaseNegative := data[n]&0x80 != 0
 	deltaBase, consumed, err := decodePrefixedInt(data[n:], 7)
 	if err != nil {
 		return nil, err
 	}
 	offset := n + consumed
-	base, err := computeQpackBase(requiredInsertCount, deltaBase, false)
+	base, err := computeQpackBase(requiredInsertCount, deltaBase, deltaBaseNegative)
 	if err != nil {
 		return nil, err
 	}
@@ -673,9 +771,8 @@ func (c *QpackCodec) DecodeFields(data []byte) ([]HeaderField, error) {
 			fields = append(fields, HeaderField{Name: entry.name, Value: value})
 		}
 	}
-	if requiredInsertCount > c.decoderAckCount {
-		c.pendingDecoder = appendPrefixedInt(c.pendingDecoder, 6, 0x00, requiredInsertCount-c.decoderAckCount)
-		c.decoderAckCount = requiredInsertCount
+	if streamID != nil && requiredInsertCount > 0 {
+		c.pendingDecoder = appendPrefixedInt(c.pendingDecoder, 7, 0x80, *streamID)
 	}
 	return fields, nil
 }
@@ -699,8 +796,7 @@ func (c *QpackCodec) queueInsertLocked(field HeaderField) {
 		c.pendingEncoder = appendPrefixedInt(c.pendingEncoder, 6, 0xC0, uint64(idx))
 		c.pendingEncoder = appendQpackString(c.pendingEncoder, field.Value)
 	} else {
-		c.pendingEncoder = append(c.pendingEncoder, 0x40)
-		c.pendingEncoder = appendQpackString(c.pendingEncoder, field.Name)
+		c.pendingEncoder = appendQpackStringWithPrefix(c.pendingEncoder, 5, 0x60, field.Name)
 		c.pendingEncoder = appendQpackString(c.pendingEncoder, field.Value)
 	}
 	if _, ok := c.localTable.insert(field.Name, field.Value); ok {
@@ -762,18 +858,24 @@ func findStaticNameFast(name string) (int, bool) {
 }
 
 func appendQpackString(dst []byte, value string) []byte {
-	dst = appendPrefixedInt(dst, 7, 0x00, uint64(len(value)))
-	return append(dst, value...)
+	return appendQpackStringWithPrefix(dst, 7, 0x80, value)
 }
 
 func decodeQpackString(data []byte) (string, int, error) {
+	return decodeQpackStringWithPrefix(data, 7)
+}
+
+func appendQpackStringWithPrefix(dst []byte, prefixBits uint8, prefixMask byte, value string) []byte {
+	dst = appendPrefixedInt(dst, prefixBits, prefixMask, hpack.HuffmanEncodeLength(value))
+	return hpack.AppendHuffmanString(dst, value)
+}
+
+func decodeQpackStringWithPrefix(data []byte, prefixBits uint8) (string, int, error) {
 	if len(data) == 0 {
 		return "", 0, errors.New("http3 truncated qpack string")
 	}
-	if data[0]&0x80 != 0 {
-		return "", 0, errors.New("http3 huffman qpack strings not supported")
-	}
-	length, consumed, err := decodePrefixedInt(data, 7)
+	huffmanEncoded := data[0]&(1<<prefixBits) != 0
+	length, consumed, err := decodePrefixedInt(data, prefixBits)
 	if err != nil {
 		return "", 0, err
 	}
@@ -782,7 +884,15 @@ func decodeQpackString(data []byte) (string, int, error) {
 	if end > len(data) {
 		return "", 0, errors.New("http3 truncated qpack string payload")
 	}
-	return string(data[start:end]), end, nil
+	payload := data[start:end]
+	if !huffmanEncoded {
+		return string(payload), end, nil
+	}
+	decoded, err := hpack.HuffmanDecodeToString(payload)
+	if err != nil {
+		return "", 0, err
+	}
+	return decoded, end, nil
 }
 
 func appendPrefixedInt(dst []byte, prefixBits uint8, prefixMask byte, value uint64) []byte {

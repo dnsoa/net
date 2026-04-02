@@ -10,19 +10,12 @@ import (
 	"github.com/dnsoa/net/httpx/core"
 )
 
-type StreamType uint64
-
-const (
-	StreamTypeControl      StreamType = 0x00
-	StreamTypePush         StreamType = 0x01
-	StreamTypeQPACKEncoder StreamType = 0x02
-	StreamTypeQPACKDecoder StreamType = 0x03
-)
-
 const (
 	SettingQPACKMaxTableCapacity uint64 = 0x01
 	SettingMaxFieldSectionSize   uint64 = 0x06
 	SettingQPACKBlockedStreams   uint64 = 0x07
+	SettingEnableConnectProtocol uint64 = 0x08
+	SettingH3Datagram            uint64 = 0x33
 )
 
 type Session struct {
@@ -32,39 +25,12 @@ type Session struct {
 	qpack            *QpackCodec
 	settingsSent     bool
 	settingsReceived bool
-}
-
-type ControlStreamOpener interface {
-	OpenControlStream() (io.Writer, error)
-	AcceptControlStream() (io.Reader, error)
-}
-
-type RequestStreamOpener interface {
-	OpenRequestStream() (io.ReadWriter, error)
-}
-
-type RequestStreamWriteCloser interface {
-	CloseWrite() error
-}
-
-type RequestStreamReadCloser interface {
-	CloseRead() error
-}
-
-type RequestStreamCanceler interface {
-	CancelRead(code ErrorCode) error
-	CancelWrite(code ErrorCode) error
-}
-
-type RequestStreamCloser interface {
-	Close() error
-}
-
-type QPACKStreamOpener interface {
-	OpenEncoderStream() (io.Writer, error)
-	AcceptEncoderStream() (io.Reader, error)
-	OpenDecoderStream() (io.Writer, error)
-	AcceptDecoderStream() (io.Reader, error)
+	encoderWriteInit bool
+	encoderReadInit  bool
+	decoderWriteInit bool
+	decoderReadInit  bool
+	encoderReadBuf   []byte
+	decoderReadBuf   []byte
 }
 
 type Transport struct {
@@ -72,6 +38,10 @@ type Transport struct {
 	controlOpener ControlStreamOpener
 	requestOpener RequestStreamOpener
 	qpackOpener   QPACKStreamOpener
+	encoderWriter io.Writer
+	encoderReader io.Reader
+	decoderWriter io.Writer
+	decoderReader io.Reader
 	bootstrapped  bool
 	bootstrapping bool
 	bootstrapCond *sync.Cond
@@ -190,7 +160,7 @@ func (t *Transport) RoundTripContext(ctx context.Context, req *core.Request) (*c
 		lifecycle.cancel(ErrRequestCancelled)
 		return nil, err
 	}
-	resp, err := t.session.ReadResponse(stream)
+	resp, err := t.session.ReadResponseOnStream(stream, stream)
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return nil, ctxErr
@@ -246,7 +216,7 @@ func (t *Transport) writeLocalQPACKEncoder() error {
 	if t.qpackOpener == nil {
 		return nil
 	}
-	writer, err := t.qpackOpener.OpenEncoderStream()
+	writer, err := t.getEncoderWriter()
 	if err != nil {
 		return err
 	}
@@ -260,21 +230,25 @@ func (t *Transport) readRemoteQPACKEncoder() error {
 	if t.qpackOpener == nil {
 		return nil
 	}
-	reader, err := t.qpackOpener.AcceptEncoderStream()
+	reader, err := t.getEncoderReader()
 	if err != nil {
 		return err
 	}
 	if reader == nil {
 		return nil
 	}
-	return t.session.ReadEncoderStream(reader)
+	err = t.session.ReadEncoderStream(reader)
+	if errors.Is(err, io.EOF) {
+		return nil
+	}
+	return err
 }
 
 func (t *Transport) writeLocalQPACKDecoder() error {
 	if t.qpackOpener == nil {
 		return nil
 	}
-	writer, err := t.qpackOpener.OpenDecoderStream()
+	writer, err := t.getDecoderWriter()
 	if err != nil {
 		return err
 	}
@@ -288,14 +262,74 @@ func (t *Transport) readRemoteQPACKDecoder() error {
 	if t.qpackOpener == nil {
 		return nil
 	}
-	reader, err := t.qpackOpener.AcceptDecoderStream()
+	reader, err := t.getDecoderReader()
 	if err != nil {
 		return err
 	}
 	if reader == nil {
 		return nil
 	}
-	return t.session.ReadDecoderStream(reader)
+	err = t.session.ReadDecoderStream(reader)
+	if errors.Is(err, io.EOF) {
+		return nil
+	}
+	return err
+}
+
+func (t *Transport) getEncoderWriter() (io.Writer, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.encoderWriter != nil {
+		return t.encoderWriter, nil
+	}
+	writer, err := t.qpackOpener.OpenEncoderStream()
+	if err != nil {
+		return nil, err
+	}
+	t.encoderWriter = writer
+	return writer, nil
+}
+
+func (t *Transport) getEncoderReader() (io.Reader, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.encoderReader != nil {
+		return t.encoderReader, nil
+	}
+	reader, err := t.qpackOpener.AcceptEncoderStream()
+	if err != nil {
+		return nil, err
+	}
+	t.encoderReader = reader
+	return reader, nil
+}
+
+func (t *Transport) getDecoderWriter() (io.Writer, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.decoderWriter != nil {
+		return t.decoderWriter, nil
+	}
+	writer, err := t.qpackOpener.OpenDecoderStream()
+	if err != nil {
+		return nil, err
+	}
+	t.decoderWriter = writer
+	return writer, nil
+}
+
+func (t *Transport) getDecoderReader() (io.Reader, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.decoderReader != nil {
+		return t.decoderReader, nil
+	}
+	reader, err := t.qpackOpener.AcceptDecoderStream()
+	if err != nil {
+		return nil, err
+	}
+	t.decoderReader = reader
+	return reader, nil
 }
 
 func (s *Session) WriteControlStream(w io.Writer) error {
@@ -325,6 +359,9 @@ func (s *Session) WriteControlStream(w io.Writer) error {
 }
 
 func (s *Session) ReadControlStream(r io.Reader) error {
+	if s.settingsReceived {
+		return errors.New("http3 control stream settings already received")
+	}
 	streamType, err := readVarIntFromReader(r)
 	if err != nil {
 		return err
@@ -332,27 +369,35 @@ func (s *Session) ReadControlStream(r io.Reader) error {
 	if StreamType(streamType) != StreamTypeControl {
 		return errors.New("http3 unexpected unidirectional stream type")
 	}
+	frame, err := readNextFrame(r)
+	if err != nil {
+		if errors.Is(err, io.EOF) {
+			return errors.New("http3 control stream missing settings frame")
+		}
+		return err
+	}
+	if FrameType(frame.Header.Type) != FrameSettings {
+		return errors.New("http3 control stream first frame must be settings")
+	}
+	settings, err := DecodeSettings(frame.Payload)
+	if err != nil {
+		return err
+	}
+	s.PeerSettings = settings
+	s.qpack.SetLocalCapacity(settings.QPACKMaxTableCap)
+	s.settingsReceived = true
 	for {
 		frame, err := readNextFrame(r)
 		if err != nil {
 			if errors.Is(err, io.EOF) {
-				break
+				return nil
 			}
 			return err
 		}
-		if FrameType(frame.Header.Type) != FrameSettings {
-			continue
+		if FrameType(frame.Header.Type) == FrameSettings {
+			return errors.New("http3 control stream must not contain duplicate settings")
 		}
-		settings, err := DecodeSettings(frame.Payload)
-		if err != nil {
-			return err
-		}
-		s.PeerSettings = settings
-		s.qpack.SetLocalCapacity(settings.QPACKMaxTableCap)
-		s.settingsReceived = true
-		return nil
 	}
-	return errors.New("http3 control stream missing settings frame")
 }
 
 func (s *Session) WriteEncoderStream(w io.Writer) error {
@@ -360,28 +405,49 @@ func (s *Session) WriteEncoderStream(w io.Writer) error {
 	if len(payload) == 0 {
 		return nil
 	}
-	buf, err := AppendVarInt(nil, uint64(StreamTypeQPACKEncoder))
-	if err != nil {
-		return err
+	buf := make([]byte, 0, len(payload)+8)
+	if !s.encoderWriteInit {
+		var err error
+		buf, err = AppendVarInt(buf, uint64(StreamTypeQPACKEncoder))
+		if err != nil {
+			return err
+		}
+		s.encoderWriteInit = true
 	}
 	buf = append(buf, payload...)
-	_, err = w.Write(buf)
+	_, err := w.Write(buf)
 	return err
 }
 
 func (s *Session) ReadEncoderStream(r io.Reader) error {
-	streamType, err := readVarIntFromReader(r)
+	chunk, err := readQPACKChunk(r)
 	if err != nil {
 		return err
 	}
-	if StreamType(streamType) != StreamTypeQPACKEncoder {
-		return errors.New("http3 unexpected qpack encoder stream type")
+	if len(chunk) == 0 && len(s.encoderReadBuf) == 0 {
+		return nil
 	}
-	payload, err := io.ReadAll(r)
+	s.encoderReadBuf = append(s.encoderReadBuf, chunk...)
+	if !s.encoderReadInit {
+		remaining, ok, err := consumeQPACKStreamType(s.encoderReadBuf, StreamTypeQPACKEncoder, "http3 unexpected qpack encoder stream type")
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return nil
+		}
+		s.encoderReadBuf = remaining
+		s.encoderReadInit = true
+	}
+	if len(s.encoderReadBuf) == 0 {
+		return nil
+	}
+	consumed, err := s.qpack.consumeEncoderInstructions(s.encoderReadBuf)
 	if err != nil {
 		return err
 	}
-	return s.qpack.ApplyEncoderInstructions(payload)
+	s.encoderReadBuf = discardConsumedPrefix(s.encoderReadBuf, consumed)
+	return nil
 }
 
 func (s *Session) WriteDecoderStream(w io.Writer) error {
@@ -389,28 +455,49 @@ func (s *Session) WriteDecoderStream(w io.Writer) error {
 	if len(payload) == 0 {
 		return nil
 	}
-	buf, err := AppendVarInt(nil, uint64(StreamTypeQPACKDecoder))
-	if err != nil {
-		return err
+	buf := make([]byte, 0, len(payload)+8)
+	if !s.decoderWriteInit {
+		var err error
+		buf, err = AppendVarInt(buf, uint64(StreamTypeQPACKDecoder))
+		if err != nil {
+			return err
+		}
+		s.decoderWriteInit = true
 	}
 	buf = append(buf, payload...)
-	_, err = w.Write(buf)
+	_, err := w.Write(buf)
 	return err
 }
 
 func (s *Session) ReadDecoderStream(r io.Reader) error {
-	streamType, err := readVarIntFromReader(r)
+	chunk, err := readQPACKChunk(r)
 	if err != nil {
 		return err
 	}
-	if StreamType(streamType) != StreamTypeQPACKDecoder {
-		return errors.New("http3 unexpected qpack decoder stream type")
+	if len(chunk) == 0 && len(s.decoderReadBuf) == 0 {
+		return nil
 	}
-	payload, err := io.ReadAll(r)
+	s.decoderReadBuf = append(s.decoderReadBuf, chunk...)
+	if !s.decoderReadInit {
+		remaining, ok, err := consumeQPACKStreamType(s.decoderReadBuf, StreamTypeQPACKDecoder, "http3 unexpected qpack decoder stream type")
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return nil
+		}
+		s.decoderReadBuf = remaining
+		s.decoderReadInit = true
+	}
+	if len(s.decoderReadBuf) == 0 {
+		return nil
+	}
+	consumed, err := s.qpack.consumeDecoderInstructions(s.decoderReadBuf)
 	if err != nil {
 		return err
 	}
-	return s.qpack.ApplyDecoderInstructions(payload)
+	s.decoderReadBuf = discardConsumedPrefix(s.decoderReadBuf, consumed)
+	return nil
 }
 
 func (s *Session) WriteRequest(w io.Writer, req *core.Request) error {
@@ -447,10 +534,14 @@ func (s *Session) WriteRequest(w io.Writer, req *core.Request) error {
 }
 
 func (s *Session) ReadRequest(r io.Reader) (*core.Request, error) {
+	return s.ReadRequestOnStream(nil, r)
+}
+
+func (s *Session) ReadRequestOnStream(stream any, r io.Reader) (*core.Request, error) {
 	if !s.settingsReceived {
 		return nil, errors.New("http3 peer settings not received")
 	}
-	message, err := s.readRequestOrResponse(r, true)
+	message, err := s.readRequestOrResponse(r, true, requestStreamID(stream))
 	if err != nil {
 		return nil, err
 	}
@@ -491,10 +582,14 @@ func (s *Session) WriteResponse(w io.Writer, resp *core.Response) error {
 }
 
 func (s *Session) ReadResponse(r io.Reader) (*core.Response, error) {
+	return s.ReadResponseOnStream(nil, r)
+}
+
+func (s *Session) ReadResponseOnStream(stream any, r io.Reader) (*core.Response, error) {
 	if !s.settingsReceived {
 		return nil, errors.New("http3 peer settings not received")
 	}
-	message, err := s.readRequestOrResponse(r, false)
+	message, err := s.readRequestOrResponse(r, false, requestStreamID(stream))
 	if err != nil {
 		return nil, err
 	}
@@ -517,6 +612,18 @@ func EncodeSettings(settings Settings, dst []byte) ([]byte, error) {
 	}
 	if settings.QPACKBlockedStreams > 0 {
 		dst, err = appendSetting(dst, SettingQPACKBlockedStreams, settings.QPACKBlockedStreams)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if settings.EnableConnectProto {
+		dst, err = appendSetting(dst, SettingEnableConnectProtocol, 1)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if settings.EnableDatagrams {
+		dst, err = appendSetting(dst, SettingH3Datagram, 1)
 		if err != nil {
 			return nil, err
 		}
@@ -545,6 +652,10 @@ func DecodeSettings(payload []byte) (Settings, error) {
 			settings.MaxFieldSectionSize = value
 		case SettingQPACKBlockedStreams:
 			settings.QPACKBlockedStreams = value
+		case SettingEnableConnectProtocol:
+			settings.EnableConnectProto = value != 0
+		case SettingH3Datagram:
+			settings.EnableDatagrams = value != 0
 		}
 	}
 	return settings, nil
@@ -581,7 +692,16 @@ func appendBody(dst, chunk []byte) []byte {
 	return append(dst, chunk...)
 }
 
-func (s *Session) readRequestOrResponse(r io.Reader, isRequest bool) (any, error) {
+func isInvalidMessageFrame(frameType FrameType) bool {
+	switch frameType {
+	case FrameCancelPush, FrameSettings, FrameGoAway, FrameMaxPushID:
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *Session) readRequestOrResponse(r io.Reader, isRequest bool, streamID *uint64) (any, error) {
 	frame, err := readNextFrame(r)
 	if err != nil {
 		return nil, err
@@ -590,11 +710,12 @@ func (s *Session) readRequestOrResponse(r io.Reader, isRequest bool) (any, error
 		return nil, errors.New("http3 message stream missing headers")
 	}
 	if isRequest {
-		req, err := s.qpack.DecodeRequest(frame.Payload)
+		req, err := s.qpack.decodeRequest(frame.Payload, streamID)
 		if err != nil {
 			return nil, err
 		}
 		var bodyData []byte
+		seenTrailers := false
 		for {
 			frame, err := readNextFrame(r)
 			if err != nil {
@@ -606,24 +727,40 @@ func (s *Session) readRequestOrResponse(r io.Reader, isRequest bool) (any, error
 				core.ReleaseRequest(req)
 				return nil, err
 			}
-			switch FrameType(frame.Header.Type) {
+			frameType := FrameType(frame.Header.Type)
+			switch frameType {
 			case FrameData:
+				if seenTrailers {
+					core.ReleaseRequest(req)
+					return nil, errors.New("http3 message stream must not contain data after trailers")
+				}
 				bodyData = appendBody(bodyData, frame.Payload)
 			case FrameHeaders:
-				trailers, err := s.qpack.DecodeTrailers(frame.Payload)
+				if seenTrailers {
+					core.ReleaseRequest(req)
+					return nil, errors.New("http3 message stream must not contain multiple trailer sections")
+				}
+				trailers, err := s.qpack.decodeTrailers(frame.Payload, streamID)
 				if err != nil {
 					core.ReleaseRequest(req)
 					return nil, err
 				}
 				req.Trailers = trailers
+				seenTrailers = true
+			default:
+				if isInvalidMessageFrame(frameType) {
+					core.ReleaseRequest(req)
+					return nil, errors.New("http3 message stream contains invalid frame type")
+				}
 			}
 		}
 	}
-	resp, err := s.qpack.DecodeResponse(frame.Payload)
+	resp, err := s.qpack.decodeResponse(frame.Payload, streamID)
 	if err != nil {
 		return nil, err
 	}
 	var bodyData []byte
+	seenTrailers := false
 	for {
 		frame, err := readNextFrame(r)
 		if err != nil {
@@ -635,16 +772,31 @@ func (s *Session) readRequestOrResponse(r io.Reader, isRequest bool) (any, error
 			core.ReleaseResponse(resp)
 			return nil, err
 		}
-		switch FrameType(frame.Header.Type) {
+		frameType := FrameType(frame.Header.Type)
+		switch frameType {
 		case FrameData:
+			if seenTrailers {
+				core.ReleaseResponse(resp)
+				return nil, errors.New("http3 message stream must not contain data after trailers")
+			}
 			bodyData = appendBody(bodyData, frame.Payload)
 		case FrameHeaders:
-			trailers, err := s.qpack.DecodeTrailers(frame.Payload)
+			if seenTrailers {
+				core.ReleaseResponse(resp)
+				return nil, errors.New("http3 message stream must not contain multiple trailer sections")
+			}
+			trailers, err := s.qpack.decodeTrailers(frame.Payload, streamID)
 			if err != nil {
 				core.ReleaseResponse(resp)
 				return nil, err
 			}
 			resp.Trailers = trailers
+			seenTrailers = true
+		default:
+			if isInvalidMessageFrame(frameType) {
+				core.ReleaseResponse(resp)
+				return nil, errors.New("http3 message stream contains invalid frame type")
+			}
 		}
 	}
 }
@@ -686,68 +838,4 @@ func readVarIntFromReader(r io.Reader) (uint64, error) {
 	}
 	value, _, err := DecodeVarInt(buf)
 	return value, err
-}
-
-type requestStreamLifecycle struct {
-	stream   io.ReadWriter
-	mu       sync.Mutex
-	closed   bool
-	readEOF  bool
-	writeEOF bool
-}
-
-func newRequestStreamLifecycle(stream io.ReadWriter) *requestStreamLifecycle {
-	return &requestStreamLifecycle{stream: stream}
-}
-
-func (l *requestStreamLifecycle) closeWrite() {
-	l.mu.Lock()
-	if l.writeEOF {
-		l.mu.Unlock()
-		return
-	}
-	l.writeEOF = true
-	l.mu.Unlock()
-	if stream, ok := l.stream.(RequestStreamWriteCloser); ok {
-		_ = stream.CloseWrite()
-	}
-}
-
-func (l *requestStreamLifecycle) closeRead() {
-	l.mu.Lock()
-	if l.readEOF {
-		l.mu.Unlock()
-		return
-	}
-	l.readEOF = true
-	l.mu.Unlock()
-	if stream, ok := l.stream.(RequestStreamReadCloser); ok {
-		_ = stream.CloseRead()
-	}
-}
-
-func (l *requestStreamLifecycle) cancel(code ErrorCode) {
-	l.mu.Lock()
-	if l.closed {
-		l.mu.Unlock()
-		return
-	}
-	l.mu.Unlock()
-	if stream, ok := l.stream.(RequestStreamCanceler); ok {
-		_ = stream.CancelWrite(code)
-		_ = stream.CancelRead(code)
-	}
-}
-
-func (l *requestStreamLifecycle) close() {
-	l.mu.Lock()
-	if l.closed {
-		l.mu.Unlock()
-		return
-	}
-	l.closed = true
-	l.mu.Unlock()
-	if stream, ok := l.stream.(RequestStreamCloser); ok {
-		_ = stream.Close()
-	}
 }

@@ -18,6 +18,8 @@ type Settings struct {
 	MaxFieldSectionSize uint64
 	QPACKMaxTableCap    uint64
 	QPACKBlockedStreams uint64
+	EnableConnectProto  bool
+	EnableDatagrams     bool
 }
 
 type ErrorCode uint64
