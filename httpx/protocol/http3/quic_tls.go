@@ -17,6 +17,7 @@ type QUICTLSHandshake struct {
 	localTransportParams []byte
 	peerTransportParams  []byte
 	pendingWrites        map[tls.QUICEncryptionLevel][]byte
+	pendingReads         map[tls.QUICEncryptionLevel]map[uint64][]byte
 	readOffsets          map[tls.QUICEncryptionLevel]uint64
 	writeOffsets         map[tls.QUICEncryptionLevel]uint64
 	handshakeComplete    bool
@@ -67,6 +68,7 @@ func newQUICTLSHandshake(conn *tls.QUICConn, transportParams []byte) (*QUICTLSHa
 		conn:                 conn,
 		localTransportParams: append([]byte(nil), transportParams...),
 		pendingWrites:        make(map[tls.QUICEncryptionLevel][]byte),
+		pendingReads:         make(map[tls.QUICEncryptionLevel]map[uint64][]byte),
 		readOffsets:          make(map[tls.QUICEncryptionLevel]uint64),
 		writeOffsets:         make(map[tls.QUICEncryptionLevel]uint64),
 		readSecrets:          make(map[tls.QUICEncryptionLevel][]byte),
@@ -112,17 +114,76 @@ func (h *QUICTLSHandshake) HandleCryptoFrames(level tls.QUICEncryptionLevel, pay
 	if len(frames) == 0 {
 		return nil
 	}
-	expectedOffset := h.readOffsets[level]
-	var cryptoData []byte
 	for _, frame := range frames {
-		if frame.Offset != expectedOffset {
-			return fmt.Errorf("http3 quic tls crypto frame out of order: level=%s expected=%d got=%d", level, expectedOffset, frame.Offset)
-		}
-		cryptoData = append(cryptoData, frame.Data...)
-		expectedOffset += uint64(len(frame.Data))
+		h.bufferCryptoFrame(level, frame)
 	}
+	expectedOffset := h.readOffsets[level]
+	cryptoData := h.drainContiguousCryptoData(level, expectedOffset)
+	if len(cryptoData) == 0 {
+		return nil
+	}
+	expectedOffset += uint64(len(cryptoData))
 	h.readOffsets[level] = expectedOffset
 	return h.HandleData(level, cryptoData)
+}
+
+func (h *QUICTLSHandshake) bufferCryptoFrame(level tls.QUICEncryptionLevel, frame QUICCryptoFrame) {
+	if h == nil {
+		return
+	}
+	if h.pendingReads[level] == nil {
+		h.pendingReads[level] = make(map[uint64][]byte)
+	}
+	pending := h.pendingReads[level]
+	expectedOffset := h.readOffsets[level]
+	frameEnd := frame.Offset + uint64(len(frame.Data))
+	if frameEnd <= expectedOffset {
+		return
+	}
+	if frame.Offset < expectedOffset {
+		frame.Data = append([]byte(nil), frame.Data[expectedOffset-frame.Offset:]...)
+		frame.Offset = expectedOffset
+	}
+	if existing, ok := pending[frame.Offset]; ok && len(existing) >= len(frame.Data) {
+		return
+	}
+	pending[frame.Offset] = append([]byte(nil), frame.Data...)
+}
+
+func (h *QUICTLSHandshake) drainContiguousCryptoData(level tls.QUICEncryptionLevel, expectedOffset uint64) []byte {
+	if h == nil || h.pendingReads[level] == nil {
+		return nil
+	}
+	pending := h.pendingReads[level]
+	var cryptoData []byte
+	for {
+		if data, ok := pending[expectedOffset]; ok {
+			cryptoData = append(cryptoData, data...)
+			delete(pending, expectedOffset)
+			expectedOffset += uint64(len(data))
+			continue
+		}
+		advanced := false
+		for offset, data := range pending {
+			dataEnd := offset + uint64(len(data))
+			if dataEnd <= expectedOffset {
+				delete(pending, offset)
+				advanced = true
+				break
+			}
+			if offset < expectedOffset && dataEnd > expectedOffset {
+				trimmed := append([]byte(nil), data[expectedOffset-offset:]...)
+				delete(pending, offset)
+				pending[expectedOffset] = trimmed
+				advanced = true
+				break
+			}
+		}
+		if !advanced {
+			break
+		}
+	}
+	return cryptoData
 }
 
 func (h *QUICTLSHandshake) DrainCryptoFrames(level tls.QUICEncryptionLevel) ([]byte, error) {
@@ -168,6 +229,28 @@ func (h *QUICTLSHandshake) LastError() error {
 		return nil
 	}
 	return h.lastError
+}
+
+func (h *QUICTLSHandshake) TLSReadSecret(level tls.QUICEncryptionLevel) ([]byte, uint16, bool) {
+	if h == nil {
+		return nil, 0, false
+	}
+	secret, ok := h.readSecrets[level]
+	if !ok || len(secret) == 0 {
+		return nil, 0, false
+	}
+	return append([]byte(nil), secret...), h.readSecretSuites[level], true
+}
+
+func (h *QUICTLSHandshake) TLSWriteSecret(level tls.QUICEncryptionLevel) ([]byte, uint16, bool) {
+	if h == nil {
+		return nil, 0, false
+	}
+	secret, ok := h.writeSecrets[level]
+	if !ok || len(secret) == 0 {
+		return nil, 0, false
+	}
+	return append([]byte(nil), secret...), h.writeSecretSuites[level], true
 }
 
 func (h *QUICTLSHandshake) drainEvents() error {

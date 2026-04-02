@@ -34,6 +34,18 @@ func ParseQUICCryptoFrames(payload []byte) ([]QUICCryptoFrame, error) {
 		case quicFrameTypePadding, quicFrameTypePing:
 			offset++
 			continue
+		case quicFrameTypeAck, quicFrameTypeAckECN:
+			_, consumed, err := ParseQUICAckFrame(payload[offset:])
+			if err != nil {
+				return nil, err
+			}
+			offset += consumed
+		case quicFrameTypeConnectionClose, quicFrameTypeConnectionCloseApp:
+			_, consumed, err := decodeConnectionCloseFrame(payload[offset:])
+			if err != nil {
+				return nil, err
+			}
+			offset += consumed
 		case quicFrameTypeCrypto:
 			frame, consumed, err := parseQUICCryptoFrame(payload[offset:])
 			if err != nil {

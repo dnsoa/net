@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"sort"
 	"strconv"
 	"strings"
@@ -102,6 +103,7 @@ type ServerConn struct {
 	Streams   PacketStreamAssembler
 	requestMu sync.Mutex
 	state     serverConnState
+	shortHeaderDestinationConnectionIDLength int
 }
 
 type requestStreamStatus uint8
@@ -177,7 +179,21 @@ type requestStreamFINTracker interface {
 }
 
 func NewServerConn(session *Session, streams PacketStreamAssembler) *ServerConn {
-	return &ServerConn{Session: session, Streams: streams}
+	return &ServerConn{
+		Session: session,
+		Streams: streams,
+		shortHeaderDestinationConnectionIDLength: DefaultShortHeaderDestinationConnectionIDLength,
+	}
+}
+
+func (c *ServerConn) SetShortHeaderDestinationConnectionIDLength(length int) {
+	if c == nil {
+		return
+	}
+	if length <= 0 {
+		length = DefaultShortHeaderDestinationConnectionIDLength
+	}
+	c.shortHeaderDestinationConnectionIDLength = length
 }
 
 func (c *ServerConn) HandlePacket(ctx context.Context, payload []byte, handler ServerRequestHandler) (ServerConnSnapshot, error) {
@@ -193,7 +209,7 @@ func (c *ServerConn) HandlePacket(ctx context.Context, payload []byte, handler S
 	}
 	packetPayload := payload
 	packetNumberSpace := QUICPacketNumberSpaceApplication
-	if header, err := ParseQUICPacketHeader(payload, DefaultShortHeaderDestinationConnectionIDLength); err == nil {
+	if header, err := ParseQUICPacketHeader(payload, c.shortHeaderDestinationConnectionIDLength); err == nil {
 		if space, ok := c.observeQUICPacketHeader(header); ok {
 			packetNumberSpace = space
 		}
@@ -314,6 +330,17 @@ func (c *ServerConn) Snapshot() ServerConnSnapshot {
 
 func (c *ServerConn) handleApplicationPacket(ctx context.Context, packet applicationPacket, handler ServerRequestHandler) error {
 	if packet.IsStreamFrame {
+		kind, ok := c.lookupPeerStreamKind(packet.StreamID)
+		if !ok {
+			kind = PeerStreamKindUnknown
+		}
+		slog.Debug("http3 parsed application stream",
+			slog.Uint64("stream_id", packet.StreamID),
+			slog.Uint64("stream_offset", packet.StreamOffset),
+			slog.Bool("fin", packet.Fin),
+			slog.Int("payload_len", len(packet.Payload)),
+			slog.String("known_kind", string(kind)),
+		)
 		if err := c.observeReceivedStreamFrame(packet); err != nil {
 			return err
 		}
@@ -370,7 +397,10 @@ func (c *ServerConn) handleTypedStream(ctx context.Context, packet applicationPa
 		if err := c.handleControlStream(packet, packet.Payload[int(prefixLen):]); err != nil {
 			return err
 		}
-		return c.flushPendingPeerPackets(ctx, packet.StreamID, handler)
+		if err := c.flushPendingPeerPackets(ctx, packet.StreamID, handler); err != nil {
+			return err
+		}
+		return c.flushPendingRequestPackets(ctx, handler)
 	case StreamTypeQPACKEncoder:
 		if err := c.claimCriticalStream(packet.StreamID, PeerStreamKindQPACKEncoder); err != nil {
 			return err
@@ -411,7 +441,10 @@ func (c *ServerConn) handleTypedStream(ctx context.Context, packet applicationPa
 func (c *ServerConn) dispatchKnownApplicationPacket(ctx context.Context, packet applicationPacket, kind PeerStreamKind, handler ServerRequestHandler) error {
 	switch kind {
 	case PeerStreamKindControl:
-		return c.handleControlStream(packet, packet.Payload)
+		if err := c.handleControlStream(packet, packet.Payload); err != nil {
+			return err
+		}
+		return c.flushPendingRequestPackets(ctx, handler)
 	case PeerStreamKindQPACKEncoder:
 		return c.handleQPACKEncoderStream(packet)
 	case PeerStreamKindQPACKDecoder:
@@ -551,6 +584,10 @@ func (c *ServerConn) applyControlFrame(frame FrameHeader, encodedFrame []byte, p
 		}
 		c.state.PeerSettingsReady = true
 		c.state.SettingsFrames++
+		slog.Debug("http3 peer settings ready",
+			slog.Uint64("control_stream_id", c.state.LastControlStreamID),
+			slog.Uint64("settings_frames", c.state.SettingsFrames),
+		)
 		return nil
 	}
 	if frameType == FrameSettings {
@@ -725,6 +762,11 @@ func (c *ServerConn) handleRequestStream(ctx context.Context, packet application
 	c.state.RequestPackets++
 	c.state.LastStreamType = ServerConnStreamTypeRequest
 	if !c.state.PeerSettingsReady {
+		if packet.IsStreamFrame {
+			c.storePeerStreamPrefixLength(packet.StreamID, 0)
+			c.storePeerStreamKind(packet.StreamID, PeerStreamKindRequest)
+			c.bufferPendingPeerPacket(packet)
+		}
 		c.state.LastMachineStep = ServerConnMachineStepRequestStreamPending
 		return nil
 	}
@@ -1547,6 +1589,32 @@ func (c *ServerConn) observeNonApplicationPacket(space QUICPacketNumberSpace, pa
 				return false, err
 			}
 			offset += consumed
+		case quicFrameTypeMaxData:
+			frame, consumed, err := ParseQUICMaxDataFrame(payload[offset:])
+			if err != nil {
+				return false, err
+			}
+			c.HandleMaxDataFrame(frame)
+			offset += consumed
+		case quicFrameTypeMaxStreamData:
+			frame, consumed, err := ParseQUICMaxStreamDataFrame(payload[offset:])
+			if err != nil {
+				return false, err
+			}
+			c.HandleMaxStreamDataFrame(frame)
+			offset += consumed
+		case quicFrameTypeDataBlocked:
+			_, consumed, err := parseQUICDataBlockedFrame(payload[offset:])
+			if err != nil {
+				return false, err
+			}
+			offset += consumed
+		case quicFrameTypeStreamDataBlocked:
+			_, _, consumed, err := parseQUICStreamDataBlockedFrame(payload[offset:])
+			if err != nil {
+				return false, err
+			}
+			offset += consumed
 		case quicFrameTypeConnectionClose, quicFrameTypeConnectionCloseApp:
 			code, consumed, err := decodeConnectionCloseFrame(payload[offset:])
 			if err != nil {
@@ -1787,6 +1855,34 @@ func (c *ServerConn) flushPendingPeerPackets(ctx context.Context, streamID uint6
 			break
 		}
 		if err := c.dispatchKnownApplicationPacket(ctx, pending, kind, handler); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (c *ServerConn) flushPendingRequestPackets(ctx context.Context, handler ServerRequestHandler) error {
+	if c == nil || !c.state.PeerSettingsReady || c.state.pendingPeerPackets == nil {
+		return nil
+	}
+	streamIDs := make([]uint64, 0, len(c.state.pendingPeerPackets))
+	for streamID, packets := range c.state.pendingPeerPackets {
+		if len(packets) == 0 {
+			continue
+		}
+		if kind, ok := c.lookupPeerStreamKind(streamID); !ok || kind != PeerStreamKindRequest {
+			continue
+		}
+		streamIDs = append(streamIDs, streamID)
+	}
+	if len(streamIDs) == 0 {
+		return nil
+	}
+	sort.Slice(streamIDs, func(i, j int) bool {
+		return streamIDs[i] < streamIDs[j]
+	})
+	for _, streamID := range streamIDs {
+		if err := c.flushPendingPeerPackets(ctx, streamID, handler); err != nil {
 			return err
 		}
 	}

@@ -40,6 +40,15 @@ func NewServerPeerConnection(session *Session, streams PacketStreamAssembler) (*
 	}, nil
 }
 
+func (c *ServerPeerConnection) SetShortHeaderDestinationConnectionIDLength(length int) {
+	if c == nil {
+		return
+	}
+	if c.server != nil {
+		c.server.SetShortHeaderDestinationConnectionIDLength(length)
+	}
+}
+
 func (c *ServerPeerConnection) Session() *Session {
 	if c == nil {
 		return nil
@@ -292,6 +301,32 @@ func (c *ServerPeerConnection) TLSConnectionState() tls.ConnectionState {
 	return c.tlsServer.ConnectionState()
 }
 
+func (c *ServerPeerConnection) TLSEnabled() bool {
+	return c != nil && c.tlsServer != nil
+}
+
+func (c *ServerPeerConnection) TLSReadSecret(level tls.QUICEncryptionLevel) ([]byte, uint16, bool) {
+	if c == nil || c.tlsServer == nil {
+		return nil, 0, false
+	}
+	secret, ok := c.tlsServer.readSecrets[level]
+	if !ok || len(secret) == 0 {
+		return nil, 0, false
+	}
+	return append([]byte(nil), secret...), c.tlsServer.readSecretSuites[level], true
+}
+
+func (c *ServerPeerConnection) TLSWriteSecret(level tls.QUICEncryptionLevel) ([]byte, uint16, bool) {
+	if c == nil || c.tlsServer == nil {
+		return nil, 0, false
+	}
+	secret, ok := c.tlsServer.writeSecrets[level]
+	if !ok || len(secret) == 0 {
+		return nil, 0, false
+	}
+	return append([]byte(nil), secret...), c.tlsServer.writeSecretSuites[level], true
+}
+
 func (c *ServerPeerConnection) HandleBusinessPacket(ctx context.Context, payload []byte, handler func(context.Context, *core.Request) (*core.Response, error)) (ServerConnSnapshot, error) {
 	if c == nil || c.server == nil {
 		return ServerConnSnapshot{}, ErrServerPeerConnectionUnavailable
@@ -309,7 +344,11 @@ func (c *ServerPeerConnection) handleTLSPacket(ctx context.Context, payload []by
 	if c == nil || c.server == nil || c.tlsServer == nil || len(payload) == 0 {
 		return false, ServerConnSnapshot{}, nil
 	}
-	header, err := ParseQUICPacketHeader(payload, DefaultShortHeaderDestinationConnectionIDLength)
+	shortHeaderDestinationConnectionIDLength := DefaultShortHeaderDestinationConnectionIDLength
+	if c.server != nil && c.server.shortHeaderDestinationConnectionIDLength > 0 {
+		shortHeaderDestinationConnectionIDLength = c.server.shortHeaderDestinationConnectionIDLength
+	}
+	header, err := ParseQUICPacketHeader(payload, shortHeaderDestinationConnectionIDLength)
 	if err != nil {
 		if errors.Is(err, ErrNotQUICPacket) || isPartialData(err) {
 			return false, ServerConnSnapshot{}, nil
@@ -325,7 +364,7 @@ func (c *ServerPeerConnection) handleTLSPacket(ctx context.Context, payload []by
 	}
 	packetPayload := payload[header.PayloadOffset:]
 	space, tracked := c.server.observeQUICPacketHeader(header)
-	if tracked {
+	if tracked && header.Type != QUICPacketTypeOneRTT {
 		if closePeer, err := c.server.observeNonApplicationPacket(space, packetPayload); err != nil {
 			return true, c.server.Snapshot(), err
 		} else if closePeer {

@@ -48,6 +48,7 @@ type QUICPacketHeader struct {
 	DestinationConnectionID []byte
 	SourceConnectionID      []byte
 	TokenLength             uint64
+	Length                  uint64
 	PacketNumberLength      int
 	PacketNumber            uint64
 	PayloadOffset           int
@@ -117,10 +118,11 @@ func parseLongHeaderPacket(packet []byte, first byte) (QUICPacketHeader, error) 
 	default:
 		return QUICPacketHeader{}, fmt.Errorf("http3 unknown quic long-header packet type 0x%x", (first>>4)&0x03)
 	}
-	_, n, err := DecodeVarInt(packet[offset:])
+	length, n, err := DecodeVarInt(packet[offset:])
 	if err != nil {
 		return QUICPacketHeader{}, err
 	}
+	header.Length = length
 	offset += n
 	if len(packet) < offset+header.PacketNumberLength {
 		return QUICPacketHeader{}, ioUnexpectedEOF()
@@ -128,6 +130,32 @@ func parseLongHeaderPacket(packet []byte, first byte) (QUICPacketHeader, error) 
 	header.PacketNumber = decodeQUICPacketNumber(packet[offset : offset+header.PacketNumberLength])
 	header.PayloadOffset = offset + header.PacketNumberLength
 	return header, nil
+}
+
+func SplitQUICDatagram(packet []byte, shortHeaderDestinationConnectionIDLength int) ([][]byte, error) {
+	if len(packet) == 0 {
+		return nil, nil
+	}
+	packets := make([][]byte, 0, 1)
+	for offset := 0; offset < len(packet); {
+		header, err := ParseQUICPacketHeader(packet[offset:], shortHeaderDestinationConnectionIDLength)
+		if err != nil {
+			return nil, err
+		}
+		packetLen := len(packet) - offset
+		if header.IsLongHeader {
+			packetLen = header.PayloadOffset + int(header.Length) - header.PacketNumberLength
+			if packetLen <= 0 || offset+packetLen > len(packet) {
+				return nil, ioUnexpectedEOF()
+			}
+		}
+		packets = append(packets, append([]byte(nil), packet[offset:offset+packetLen]...))
+		offset += packetLen
+		if !header.IsLongHeader {
+			break
+		}
+	}
+	return packets, nil
 }
 
 func parseShortHeaderPacket(packet []byte, first byte, shortHeaderDestinationConnectionIDLength int) (QUICPacketHeader, error) {

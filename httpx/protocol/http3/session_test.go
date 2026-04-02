@@ -1792,6 +1792,76 @@ func TestServerConnDispatchesSafeRequestBeforeFIN(t *testing.T) {
 	}
 }
 
+func TestServerConnBuffersRequestUntilPeerSettingsReady(t *testing.T) {
+	client := NewClientSession()
+	client.settingsSent = true
+
+	server := NewServerSession()
+	server.settingsSent = true
+
+	streams := NewMemoryStreamOpenerFactory().NewStreamOpener()
+	conn := NewServerConn(server, streams)
+
+	req := core.AcquireRequest()
+	defer core.ReleaseRequest(req)
+	initRequest(req, core.MethodGet, "https://cdn.example.com/video/seg.ts")
+
+	var encodedRequest bytes.Buffer
+	if err := client.WriteRequest(&encodedRequest, req); err != nil {
+		t.Fatalf("encode request: %v", err)
+	}
+	requestFrame, err := buildQUICStreamFrame(0, 0, encodedRequest.Bytes(), true)
+	if err != nil {
+		t.Fatalf("build request frame: %v", err)
+	}
+
+	var handlerCalls atomic.Int32
+	handler := ServerRequestHandlerFunc(func(ctx context.Context, got *core.Request) (*core.Response, error) {
+		handlerCalls.Add(1)
+		resp := core.AcquireResponse()
+		resp.Status = core.NewStatus(204)
+		return resp, nil
+	})
+
+	snapshot, err := conn.HandlePacket(context.Background(), requestFrame, handler)
+	if err != nil {
+		t.Fatalf("handle request before settings: %v", err)
+	}
+	if got := handlerCalls.Load(); got != 0 {
+		t.Fatalf("expected buffered request before settings, got %d handler calls", got)
+	}
+	if snapshot.LastMachineStep != ServerConnMachineStepRequestStreamPending {
+		t.Fatalf("expected pending machine step before settings, got %q", snapshot.LastMachineStep)
+	}
+	if snapshot.PeerSettingsReady {
+		t.Fatal("expected peer settings to remain unavailable before control stream")
+	}
+
+	pendingControlFrame, prefixControlFrame, err := buildPendingControlStreamFrames(0)
+	if err != nil {
+		t.Fatalf("build control stream frames: %v", err)
+	}
+	snapshot, err = conn.HandlePacket(context.Background(), append(prefixControlFrame, pendingControlFrame...), handler)
+	if err != nil {
+		t.Fatalf("handle control stream after buffered request: %v", err)
+	}
+	if got := handlerCalls.Load(); got != 1 {
+		t.Fatalf("expected buffered request to replay after settings, got %d handler calls", got)
+	}
+	if !snapshot.PeerSettingsReady {
+		t.Fatal("expected peer settings to be ready after control stream")
+	}
+	if snapshot.RequestsHandled != 1 {
+		t.Fatalf("expected 1 handled request after replay, got %d", snapshot.RequestsHandled)
+	}
+	if snapshot.ResponsesWritten != 1 {
+		t.Fatalf("expected 1 written response after replay, got %d", snapshot.ResponsesWritten)
+	}
+	if snapshot.LastMachineStep != ServerConnMachineStepRequestStreamResponse {
+		t.Fatalf("expected request response machine step after replay, got %q", snapshot.LastMachineStep)
+	}
+}
+
 func TestServerConnStreamsPotentialBodyRequestBeforeFIN(t *testing.T) {
 	client := NewClientSession()
 	client.settingsSent = true
