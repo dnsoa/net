@@ -446,7 +446,7 @@ func (s *Session) ReadControlStream(r io.Reader) error {
 
 func (s *Session) WriteEncoderStream(w io.Writer) error {
 	payload := s.qpack.DrainEncoderInstructions()
-	if len(payload) == 0 {
+	if len(payload) == 0 && s.encoderWriteInit {
 		return nil
 	}
 	buf := make([]byte, 0, len(payload)+8)
@@ -499,7 +499,7 @@ func (s *Session) ReadEncoderStream(r io.Reader) error {
 
 func (s *Session) WriteDecoderStream(w io.Writer) error {
 	payload := s.qpack.DrainDecoderInstructions()
-	if len(payload) == 0 {
+	if len(payload) == 0 && s.decoderWriteInit {
 		return nil
 	}
 	buf := make([]byte, 0, len(payload)+8)

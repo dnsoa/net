@@ -1009,6 +1009,30 @@ func TestQpackWriteEncoderStreamWritesStreamTypeOnce(t *testing.T) {
 	}
 }
 
+func TestQpackWriteEncoderStreamWritesStreamTypeWithoutInstructions(t *testing.T) {
+	session := NewClientSession()
+
+	var stream bytes.Buffer
+	if err := session.WriteEncoderStream(&stream); err != nil {
+		t.Fatalf("write encoder stream prefix: %v", err)
+	}
+	prefix, err := AppendVarInt(nil, uint64(StreamTypeQPACKEncoder))
+	if err != nil {
+		t.Fatalf("encode encoder stream type: %v", err)
+	}
+	if !bytes.Equal(stream.Bytes(), prefix) {
+		t.Fatalf("unexpected encoder stream bytes %v want %v", stream.Bytes(), prefix)
+	}
+
+	stream.Reset()
+	if err := session.WriteEncoderStream(&stream); err != nil {
+		t.Fatalf("rewrite empty encoder stream: %v", err)
+	}
+	if stream.Len() != 0 {
+		t.Fatalf("expected no encoder bytes after initialization, got %v", stream.Bytes())
+	}
+}
+
 func TestQpackReadEncoderStreamAcceptsContinuedChunks(t *testing.T) {
 	writer := NewClientSession()
 	reader := NewServerSession()
@@ -1082,6 +1106,30 @@ func TestQpackReadEncoderStreamAcceptsSplitInstructionChunks(t *testing.T) {
 	}
 	if reader.qpack.remoteTable.insertCount == 0 {
 		t.Fatal("expected insert to apply after completed split chunks")
+	}
+}
+
+func TestQpackWriteDecoderStreamWritesStreamTypeWithoutInstructions(t *testing.T) {
+	session := NewServerSession()
+
+	var stream bytes.Buffer
+	if err := session.WriteDecoderStream(&stream); err != nil {
+		t.Fatalf("write decoder stream prefix: %v", err)
+	}
+	prefix, err := AppendVarInt(nil, uint64(StreamTypeQPACKDecoder))
+	if err != nil {
+		t.Fatalf("encode decoder stream type: %v", err)
+	}
+	if !bytes.Equal(stream.Bytes(), prefix) {
+		t.Fatalf("unexpected decoder stream bytes %v want %v", stream.Bytes(), prefix)
+	}
+
+	stream.Reset()
+	if err := session.WriteDecoderStream(&stream); err != nil {
+		t.Fatalf("rewrite empty decoder stream: %v", err)
+	}
+	if stream.Len() != 0 {
+		t.Fatalf("expected no decoder bytes after initialization, got %v", stream.Bytes())
 	}
 }
 

@@ -26,6 +26,12 @@ const (
 	quicFrameTypePing               byte = 0x01
 	quicFrameTypeResetStream        byte = 0x04
 	quicFrameTypeStopSending        byte = 0x05
+	quicFrameTypeMaxStreamsBidi     byte = 0x12
+	quicFrameTypeMaxStreamsUni      byte = 0x13
+	quicFrameTypeNewConnectionID    byte = 0x18
+	quicFrameTypeRetireConnectionID byte = 0x19
+	quicFrameTypePathChallenge      byte = 0x1a
+	quicFrameTypePathResponse       byte = 0x1b
 	quicFrameTypeConnectionClose    byte = 0x1c
 	quicFrameTypeConnectionCloseApp byte = 0x1d
 )
@@ -95,7 +101,8 @@ type ServerConnSnapshot struct {
 	InitialPacketSpace     QUICPacketNumberSpaceSnapshot
 	HandshakePacketSpace   QUICPacketNumberSpaceSnapshot
 	ApplicationPacketSpace QUICPacketNumberSpaceSnapshot
-	PeerStreamKinds        map[uint64]PeerStreamKind
+	PeerStreamKinds           map[uint64]PeerStreamKind
+	PeerConnectionIDFromFrame []byte
 }
 
 type ServerConn struct {
@@ -158,10 +165,11 @@ type serverConnState struct {
 	initialPacketSpace     quicPacketNumberSpaceState
 	handshakePacketSpace   quicPacketNumberSpaceState
 	applicationPacketSpace quicPacketNumberSpaceState
-	peerStreamKinds        map[uint64]PeerStreamKind
-	peerStreamPrefixLens   map[uint64]uint64
-	pendingPeerPackets     map[uint64][]applicationPacket
-	requestStreams         map[uint64]requestStreamStatus
+	peerStreamKinds           map[uint64]PeerStreamKind
+	peerStreamPrefixLens     map[uint64]uint64
+	pendingPeerPackets       map[uint64][]applicationPacket
+	requestStreams           map[uint64]requestStreamStatus
+	peerConnectionIDFromFrame []byte
 }
 
 type applicationPacket struct {
@@ -316,9 +324,12 @@ func (c *ServerConn) Snapshot() ServerConnSnapshot {
 		KeepAlive:              c.state.keepAlive.snapshot(),
 		InitialPacketSpace:     c.state.initialPacketSpace.snapshot(),
 		HandshakePacketSpace:   c.state.handshakePacketSpace.snapshot(),
-		ApplicationPacketSpace: c.state.applicationPacketSpace.snapshot(),
-	}
-	c.requestMu.Unlock()
+			ApplicationPacketSpace: c.state.applicationPacketSpace.snapshot(),
+		}
+		if len(c.state.peerConnectionIDFromFrame) > 0 {
+			snapshot.PeerConnectionIDFromFrame = append([]byte(nil), c.state.peerConnectionIDFromFrame...)
+		}
+		c.requestMu.Unlock()
 	if len(c.state.peerStreamKinds) > 0 {
 		snapshot.PeerStreamKinds = make(map[uint64]PeerStreamKind, len(c.state.peerStreamKinds))
 		for streamID, kind := range c.state.peerStreamKinds {
@@ -1193,10 +1204,16 @@ func (c *ServerConn) parseApplicationPackets(space QUICPacketNumberSpace, payloa
 			continue
 		}
 		if !isQUICStreamFrame(frameType) {
-			if len(frames) == 0 && !consumedControl {
-				return []applicationPacket{{StreamID: implicitRequestStreamID, Payload: payload}}, false, consumedControl, nil
+			skipped, skipErr := skipQUICFrame(payload[offset:])
+			if skipErr != nil {
+				if len(frames) == 0 && !consumedControl {
+					return []applicationPacket{{StreamID: implicitRequestStreamID, Payload: payload}}, false, consumedControl, nil
+				}
+				return nil, false, consumedControl, fmt.Errorf("unsupported quic frame type 0x%x: %w", frameType, skipErr)
 			}
-			return nil, false, consumedControl, fmt.Errorf("unsupported quic frame type 0x%x", frameType)
+			slog.Debug("http3 skipping unknown quic frame", slog.Uint64("frame_type", uint64(frameType)), slog.Int("skipped_bytes", skipped))
+			offset += skipped
+			continue
 		}
 		frame, consumed, err := parseApplicationStreamFrame(payload[offset:])
 		if err != nil {
@@ -1319,7 +1336,13 @@ func parseApplicationStreamFrame(payload []byte) (applicationPacket, int, error)
 
 func looksLikeQUICFrameSequence(frameType byte) bool {
 	switch frameType {
-	case quicFrameTypePadding, quicFrameTypePing, quicFrameTypeAck, quicFrameTypeAckECN, quicFrameTypeCrypto, quicFrameTypeResetStream, quicFrameTypeStopSending, quicFrameTypeConnectionClose, quicFrameTypeConnectionCloseApp, quicFrameTypeMaxData, quicFrameTypeMaxStreamData, quicFrameTypeDataBlocked, quicFrameTypeStreamDataBlocked:
+	case quicFrameTypePadding, quicFrameTypePing, quicFrameTypeAck, quicFrameTypeAckECN,
+		quicFrameTypeCrypto, quicFrameTypeResetStream, quicFrameTypeStopSending,
+		quicFrameTypeMaxStreamsBidi, quicFrameTypeMaxStreamsUni,
+		quicFrameTypeNewConnectionID, quicFrameTypeRetireConnectionID,
+		quicFrameTypePathChallenge, quicFrameTypePathResponse,
+		quicFrameTypeConnectionClose, quicFrameTypeConnectionCloseApp,
+		quicFrameTypeMaxData, quicFrameTypeMaxStreamData, quicFrameTypeDataBlocked, quicFrameTypeStreamDataBlocked:
 		return true
 	default:
 		return isQUICStreamFrame(frameType)
@@ -1328,6 +1351,32 @@ func looksLikeQUICFrameSequence(frameType byte) bool {
 
 func isQUICStreamFrame(frameType byte) bool {
 	return frameType >= quicStreamFrameTypeBase && frameType <= quicStreamFrameTypeMax
+}
+
+// skipQUICFrame skips a single QUIC frame by reading the VarInt type and VarInt length,
+// returning the total number of bytes to advance (header + payload). Returns an error if
+// the payload is too short to contain a valid frame. Per RFC 9000, unknown frame types
+// must be ignored.
+func skipQUICFrame(payload []byte) (int, error) {
+	if len(payload) == 0 {
+		return 0, io.ErrUnexpectedEOF
+	}
+	_, typeLen, err := DecodeVarInt(payload)
+	if err != nil {
+		return 0, err
+	}
+	if len(payload) < typeLen {
+		return 0, io.ErrUnexpectedEOF
+	}
+	frameLength, lengthLen, err := DecodeVarInt(payload[typeLen:])
+	if err != nil {
+		return 0, err
+	}
+	total := typeLen + lengthLen + int(frameLength)
+	if total > len(payload) {
+		return 0, io.ErrUnexpectedEOF
+	}
+	return total, nil
 }
 
 func (c *ServerConn) packetSpaceState(space QUICPacketNumberSpace) *quicPacketNumberSpaceState {

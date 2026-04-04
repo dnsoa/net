@@ -12,7 +12,7 @@ const (
 	quicFrameTypeStreamDataBlocked byte = 0x15
 
 	quicInitialConnectionReceiveWindow = 1 << 20
-	quicInitialStreamReceiveWindow     = 256 << 10
+	quicInitialStreamReceiveWindow     = 1 << 20
 )
 
 type QUICMaxDataFrame struct {
@@ -184,7 +184,19 @@ func (s *quicFlowControlState) consumeAllStream(streamID uint64) {
 		return
 	}
 	stream := s.ensureStream(streamID)
-	s.consumeStream(streamID, stream.highestReceived)
+	// Clear the stream-level pending flag: the stream is finishing so there
+	// is no point advertising a larger receive window to the peer.
+	stream.pendingMaxData = false
+	consumedThrough := stream.highestReceived
+	if consumedThrough <= stream.consumedBytes {
+		return
+	}
+	delta := consumedThrough - stream.consumedBytes
+	stream.consumedBytes = consumedThrough
+	s.consumedBytes += delta
+	stream.localMaxData += delta
+	s.localMaxData += delta
+	s.pendingMaxData = true
 }
 
 func (s *quicFlowControlState) observeMaxData(maximumData uint64) {
