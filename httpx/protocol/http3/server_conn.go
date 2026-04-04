@@ -34,6 +34,10 @@ const (
 	quicFrameTypePathResponse       byte = 0x1b
 	quicFrameTypeConnectionClose    byte = 0x1c
 	quicFrameTypeConnectionCloseApp byte = 0x1d
+	quicFrameTypeHandshakeDone      byte = 0x1e
+	quicFrameTypeNewToken           byte = 0x07
+	quicFrameTypeStreamsBlockedBidi byte = 0x16
+	quicFrameTypeStreamsBlockedUni  byte = 0x17
 )
 
 type PeerStreamKind string
@@ -1193,6 +1197,82 @@ func (c *ServerConn) parseApplicationPackets(space QUICPacketNumberSpace, payloa
 			consumedControl = true
 			offset += consumed
 			continue
+		case quicFrameTypeNewToken:
+			// type(i) + length(i) + token(..)
+			offset++
+			_, consumed, err := DecodeVarInt(payload[offset:])
+			if err != nil {
+				return nil, false, consumedControl, err
+			}
+			offset += consumed
+			length, _, err := DecodeVarInt(payload[offset:])
+			if err != nil {
+				return nil, false, consumedControl, err
+			}
+			offset += consumed
+			if offset+int(length) > len(payload) {
+				return nil, false, consumedControl, io.ErrUnexpectedEOF
+			}
+			offset += int(length)
+			continue
+		case quicFrameTypeMaxStreamsBidi, quicFrameTypeMaxStreamsUni:
+			// type(i) + maximum_streams(i)
+			_, consumed, err := DecodeVarInt(payload[offset:])
+			if err != nil {
+				return nil, false, consumedControl, err
+			}
+			offset += consumed
+			continue
+		case quicFrameTypeStreamsBlockedBidi, quicFrameTypeStreamsBlockedUni:
+			// type(i) + maximum_streams(i)
+			_, consumed, err := DecodeVarInt(payload[offset:])
+			if err != nil {
+				return nil, false, consumedControl, err
+			}
+			offset += consumed
+			continue
+		case quicFrameTypeNewConnectionID:
+			// type(i) + seq(i) + retire_prior_to(i) + length(i) + cid(length) + token(16)
+			offset++
+			_, consumed, err := DecodeVarInt(payload[offset:])
+			if err != nil {
+				return nil, false, consumedControl, err
+			}
+			offset += consumed
+			_, consumed, err = DecodeVarInt(payload[offset:])
+			if err != nil {
+				return nil, false, consumedControl, err
+			}
+			offset += consumed
+			cidLen, consumed, err := DecodeVarInt(payload[offset:])
+			if err != nil {
+				return nil, false, consumedControl, err
+			}
+			offset += consumed
+			if offset+int(cidLen)+16 > len(payload) {
+				return nil, false, consumedControl, io.ErrUnexpectedEOF
+			}
+			offset += int(cidLen) + 16
+			continue
+		case quicFrameTypeRetireConnectionID:
+			// type(i) + seq(i)
+			_, consumed, err := DecodeVarInt(payload[offset:])
+			if err != nil {
+				return nil, false, consumedControl, err
+			}
+			offset += consumed
+			continue
+		case quicFrameTypePathChallenge, quicFrameTypePathResponse:
+			// type(i) + data(8)
+			if len(payload[offset:]) < 8 {
+				return nil, false, consumedControl, io.ErrUnexpectedEOF
+			}
+			offset += 8
+			continue
+		case quicFrameTypeHandshakeDone:
+			// type(i) only
+			offset++
+			continue
 		}
 		if frameType == quicFrameTypeCrypto {
 			_, consumed, err := parseQUICCryptoFrame(payload[offset:])
@@ -1338,9 +1418,12 @@ func looksLikeQUICFrameSequence(frameType byte) bool {
 	switch frameType {
 	case quicFrameTypePadding, quicFrameTypePing, quicFrameTypeAck, quicFrameTypeAckECN,
 		quicFrameTypeCrypto, quicFrameTypeResetStream, quicFrameTypeStopSending,
+		quicFrameTypeNewToken,
 		quicFrameTypeMaxStreamsBidi, quicFrameTypeMaxStreamsUni,
+		quicFrameTypeStreamsBlockedBidi, quicFrameTypeStreamsBlockedUni,
 		quicFrameTypeNewConnectionID, quicFrameTypeRetireConnectionID,
 		quicFrameTypePathChallenge, quicFrameTypePathResponse,
+		quicFrameTypeHandshakeDone,
 		quicFrameTypeConnectionClose, quicFrameTypeConnectionCloseApp,
 		quicFrameTypeMaxData, quicFrameTypeMaxStreamData, quicFrameTypeDataBlocked, quicFrameTypeStreamDataBlocked:
 		return true
