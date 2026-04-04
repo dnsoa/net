@@ -157,6 +157,20 @@ func (c *ServerPeerConnection) DrainPendingFlowControlFrames() ([]byte, error) {
 	return c.server.DrainPendingFlowControlFrames()
 }
 
+func (c *ServerPeerConnection) SetPeerMaxData(maxData uint64) {
+	if c == nil || c.server == nil {
+		return
+	}
+	c.server.SetPeerMaxData(maxData)
+}
+
+func (c *ServerPeerConnection) SetPeerStreamMaxData(streamID uint64, maxData uint64) {
+	if c == nil || c.server == nil {
+		return
+	}
+	c.server.SetPeerStreamMaxData(streamID, maxData)
+}
+
 func (c *ServerPeerConnection) KeepAliveSnapshot() QUICKeepAliveSnapshot {
 	if c == nil || c.server == nil {
 		return QUICKeepAliveSnapshot{}

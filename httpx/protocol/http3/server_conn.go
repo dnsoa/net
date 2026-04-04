@@ -1551,6 +1551,20 @@ func (c *ServerConn) HandleMaxStreamDataFrame(frame QUICMaxStreamDataFrame) {
 	c.state.flowControl.observeMaxStreamData(frame.StreamID, frame.MaximumStreamData)
 }
 
+func (c *ServerConn) SetPeerMaxData(maxData uint64) {
+	if c == nil {
+		return
+	}
+	c.state.flowControl.setPeerMaxData(maxData)
+}
+
+func (c *ServerConn) SetPeerStreamMaxData(streamID uint64, maxData uint64) {
+	if c == nil {
+		return
+	}
+	c.state.flowControl.setPeerStreamMaxData(streamID, maxData)
+}
+
 func (c *ServerConn) FlowControlSnapshot() QUICFlowControlSnapshot {
 	if c == nil {
 		return QUICFlowControlSnapshot{}

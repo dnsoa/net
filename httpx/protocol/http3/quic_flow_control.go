@@ -2,6 +2,7 @@ package http3
 
 import (
 	"fmt"
+	"log"
 	"sort"
 )
 
@@ -214,6 +215,27 @@ func (s *quicFlowControlState) observeMaxStreamData(streamID uint64, maximumData
 	}
 }
 
+func (s *quicFlowControlState) setPeerMaxData(maxData uint64) {
+	if s == nil {
+		return
+	}
+	s.ensureDefaults()
+	if maxData > 0 {
+		s.peerMaxData = maxData
+	}
+}
+
+func (s *quicFlowControlState) setPeerStreamMaxData(streamID uint64, maxData uint64) {
+	if s == nil {
+		return
+	}
+	s.ensureDefaults()
+	stream := s.ensureStream(streamID)
+	if maxData > 0 {
+		stream.peerMaxData = maxData
+	}
+}
+
 func (s *quicFlowControlState) observeSentPacket(packet QUICSentPacket) error {
 	if s == nil {
 		return nil
@@ -249,6 +271,22 @@ func (s *quicFlowControlState) observeSentStream(streamID uint64, offset uint64,
 	return nil
 }
 
+// ObserveSentPacketForStream logs the flow control state for STREAM frames
+// to help diagnose ERR_CLOSING issues. It returns the same result as
+// observeSentPacket.
+func (s *quicFlowControlState) ObserveSentPacketForStream(streamID uint64, offset, payloadLen int) error {
+	s.ensureDefaults()
+	stream := s.ensureStream(streamID)
+	highestSentBefore := stream.highestSent
+	err := s.observeSentStream(streamID, uint64(offset), payloadLen)
+	errStr := ""
+	if err != nil {
+		errStr = err.Error()
+	}
+	log.Printf("http3 flow control: stream=%d offset=%d len=%d end=%d highest_sent_before=%d peer_max_data=%d conn_sent=%d err=%s",
+		streamID, offset, payloadLen, uint64(offset)+uint64(payloadLen), highestSentBefore, stream.peerMaxData, s.sentBytes, errStr)
+	return err
+}
 func (s *quicFlowControlState) canSendStream(streamID uint64, offset uint64, payloadLen int) bool {
 	if s == nil {
 		return false
