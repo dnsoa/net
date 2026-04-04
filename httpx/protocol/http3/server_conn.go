@@ -1757,8 +1757,46 @@ func (c *ServerConn) observeNonApplicationPacket(space QUICPacketNumberSpace, pa
 			}
 			offset += consumed
 			return true, nil
+		case quicFrameTypeNewConnectionID:
+			offset++
+			_, consumed, err := DecodeVarInt(payload[offset:])
+			if err != nil {
+				return false, err
+			}
+			offset += consumed
+			_, consumed, err = DecodeVarInt(payload[offset:])
+			if err != nil {
+				return false, err
+			}
+			offset += consumed
+			cidLen, consumed, err := DecodeVarInt(payload[offset:])
+			if err != nil {
+				return false, err
+			}
+			offset += consumed
+			if offset+int(cidLen)+16 > len(payload) {
+				return false, io.ErrUnexpectedEOF
+			}
+			offset += int(cidLen) + 16
+		case quicFrameTypeRetireConnectionID:
+			offset++
+			_, consumed, err := DecodeVarInt(payload[offset:])
+			if err != nil {
+				return false, err
+			}
+			offset += consumed
+		case quicFrameTypePathChallenge, quicFrameTypePathResponse:
+			if len(payload[offset:]) < 9 {
+				return false, io.ErrUnexpectedEOF
+			}
+			offset += 9
 		default:
-			return false, fmt.Errorf("unsupported quic non-application frame type 0x%x", frameType)
+			skipped, skipErr := skipQUICFrame(payload[offset:])
+			if skipErr != nil {
+				return false, skipErr
+			}
+			slog.Debug("http3 skipping unknown non-application frame", slog.Uint64("frame_type", uint64(frameType)), slog.Int("skipped_bytes", skipped))
+			offset += skipped
 		}
 	}
 	return false, nil

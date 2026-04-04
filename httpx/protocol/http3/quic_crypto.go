@@ -53,8 +53,45 @@ func ParseQUICCryptoFrames(payload []byte) ([]QUICCryptoFrame, error) {
 			}
 			frames = append(frames, frame)
 			offset += consumed
+		case quicFrameTypeNewConnectionID:
+			offset++
+			_, consumed, err := DecodeVarInt(payload[offset:])
+			if err != nil {
+				return nil, err
+			}
+			offset += consumed
+			_, consumed, err = DecodeVarInt(payload[offset:])
+			if err != nil {
+				return nil, err
+			}
+			offset += consumed
+			cidLen, consumed, err := DecodeVarInt(payload[offset:])
+			if err != nil {
+				return nil, err
+			}
+			offset += consumed
+			if offset+int(cidLen)+16 > len(payload) {
+				return nil, io.ErrUnexpectedEOF
+			}
+			offset += int(cidLen) + 16
+		case quicFrameTypeRetireConnectionID:
+			offset++
+			_, consumed, err := DecodeVarInt(payload[offset:])
+			if err != nil {
+				return nil, err
+			}
+			offset += consumed
+		case quicFrameTypePathChallenge, quicFrameTypePathResponse:
+			if len(payload[offset:]) < 9 {
+				return nil, io.ErrUnexpectedEOF
+			}
+			offset += 9
 		default:
-			return nil, fmt.Errorf("http3 unsupported quic handshake frame type 0x%x", payload[offset])
+			skipped, skipErr := skipQUICFrame(payload[offset:])
+			if skipErr != nil {
+				return nil, fmt.Errorf("http3 unsupported quic handshake frame type 0x%x: %w", payload[offset], skipErr)
+			}
+			offset += skipped
 		}
 	}
 	return frames, nil
