@@ -8,7 +8,6 @@ import (
 	"github.com/dnsoa/net/httpx/core"
 	protohttp1 "github.com/dnsoa/net/httpx/protocol/http1"
 	protohttp2 "github.com/dnsoa/net/httpx/protocol/http2"
-	protohttp3 "github.com/dnsoa/net/httpx/protocol/http3"
 )
 
 func nopCloser(b []byte) io.ReadCloser {
@@ -347,102 +346,7 @@ func BenchmarkHTTP2MultipleStreams(b *testing.B) {
 }
 
 // ============================================================================
-// HTTP/3 Benchmarks - Request/Response Encoding/Decoding
-// ============================================================================
-
-// BenchmarkHTTP3RequestEncode tests encoding an HTTP/3 request with QPACK
-func BenchmarkHTTP3RequestEncode(b *testing.B) {
-	codec := protohttp3.NewQpackCodec()
-	codec.SetLocalCapacity(4096)
-
-	req := core.AcquireRequest()
-	defer core.ReleaseRequest(req)
-	initRequest(req, core.MethodPost, "https://example.com/api/data")
-	req.Headers.SetString("content-type", "application/json")
-	req.Headers.SetString("authorization", "Bearer token123abc")
-	req.Headers.SetString("x-request-id", "req-123-456")
-	req.SetBody(nopCloser([]byte(`{"data":"test"}`)))
-
-	b.ResetTimer()
-	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
-		_, err := codec.EncodeRequest(req)
-		if err != nil {
-			b.Fatal(err)
-		}
-	}
-}
-
-// BenchmarkHTTP3RequestDecode tests decoding an HTTP/3 request
-func BenchmarkHTTP3RequestDecode(b *testing.B) {
-	codec := protohttp3.NewQpackCodec()
-	codec.SetLocalCapacity(4096)
-
-	req := core.AcquireRequest()
-	initRequest(req, core.MethodGet, "https://example.com/api/users")
-	req.Headers.SetString("user-agent", "Mozilla/5.0")
-	req.Headers.SetString("accept", "application/json")
-	encoded, _ := codec.EncodeRequest(req)
-	core.ReleaseRequest(req)
-
-	b.ResetTimer()
-	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
-		decoded, err := codec.DecodeRequest(encoded)
-		if err != nil {
-			b.Fatal(err)
-		}
-		core.ReleaseRequest(decoded)
-	}
-}
-
-// BenchmarkHTTP3ResponseEncode tests encoding an HTTP/3 response
-func BenchmarkHTTP3ResponseEncode(b *testing.B) {
-	codec := protohttp3.NewQpackCodec()
-	codec.SetLocalCapacity(4096)
-
-	resp := core.AcquireResponse()
-	defer core.ReleaseResponse(resp)
-	resp.Status = core.NewStatus(200)
-	resp.Headers.SetString("content-type", "application/json")
-	resp.Headers.SetString("x-cache-status", "HIT")
-	resp.SetBody(nopCloser([]byte(`{"users":[]}`)))
-
-	b.ResetTimer()
-	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
-		_, err := codec.EncodeResponse(resp)
-		if err != nil {
-			b.Fatal(err)
-		}
-	}
-}
-
-// BenchmarkHTTP3ResponseDecode tests decoding an HTTP/3 response
-func BenchmarkHTTP3ResponseDecode(b *testing.B) {
-	codec := protohttp3.NewQpackCodec()
-	codec.SetLocalCapacity(4096)
-
-	resp := core.AcquireResponse()
-	resp.Status = core.NewStatus(200)
-	resp.Headers.SetString("content-type", "text/html")
-	resp.Headers.SetString("content-length", "1024")
-	encoded, _ := codec.EncodeResponse(resp)
-	core.ReleaseResponse(resp)
-
-	b.ResetTimer()
-	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
-		decoded, err := codec.DecodeResponse(encoded)
-		if err != nil {
-			b.Fatal(err)
-		}
-		core.ReleaseResponse(decoded)
-	}
-}
-
-// ============================================================================
-// Comparative Benchmarks - HTTP/1 vs HTTP/3
+// Comparative Benchmarks - HTTP/1 vs HTTP/2
 // ============================================================================
 
 // BenchmarkCompareRequestEncoding compares request encoding across protocols
@@ -476,21 +380,6 @@ func BenchmarkCompareRequestEncoding_HTTP2(b *testing.B) {
 		mgr := protohttp2.NewStreamManager(true, protohttp2.DefaultConnectionSettings(), protohttp2.DefaultConnectionSettings())
 		stream, _ := mgr.OpenStream()
 		_, _ = mgr.BuildRequestHeaderFrames(stream.ID, req, true)
-	}
-}
-
-func BenchmarkCompareRequestEncoding_HTTP3(b *testing.B) {
-	codec := protohttp3.NewQpackCodec()
-
-	req := core.AcquireRequest()
-	defer core.ReleaseRequest(req)
-	initRequest(req, core.MethodGet, "https://example.com/api/data")
-	req.Headers.SetString("accept", "application/json")
-
-	b.ResetTimer()
-	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
-		_, _ = codec.EncodeRequest(req)
 	}
 }
 
@@ -530,18 +419,3 @@ func BenchmarkCompareResponseEncoding_HTTP2(b *testing.B) {
 	}
 }
 
-func BenchmarkCompareResponseEncoding_HTTP3(b *testing.B) {
-	codec := protohttp3.NewQpackCodec()
-
-	resp := core.AcquireResponse()
-	defer core.ReleaseResponse(resp)
-	resp.Status = core.NewStatus(200)
-	resp.Headers.SetString("content-type", "application/json")
-	resp.SetBody(nopCloser([]byte(`{"result":"success"}`)))
-
-	b.ResetTimer()
-	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
-		_, _ = codec.EncodeResponse(resp)
-	}
-}
