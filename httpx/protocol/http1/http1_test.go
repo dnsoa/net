@@ -113,6 +113,48 @@ func TestFormatRequestChunkedWithTrailers(t *testing.T) {
 	}
 }
 
+func TestConnWriteRequestChunkedStreaming(t *testing.T) {
+	reader, writer := io.Pipe()
+	defer reader.Close()
+
+	var out bytes.Buffer
+	conn := NewConn(nil, &out)
+	defer conn.Close()
+
+	req := core.AcquireRequest()
+	defer core.ReleaseRequest(req)
+	initRequest(req, core.MethodPost, "https://example.com/upload")
+	req.Headers.Set(core.HeaderTransferEncoding, []byte("chunked"))
+	req.Trailers.SetString("x-origin-status", "stale")
+	req.SetBody(reader)
+
+	done := make(chan error, 1)
+	go func() {
+		done <- conn.WriteRequest(req)
+	}()
+
+	if _, err := writer.Write([]byte("hello")); err != nil {
+		t.Fatalf("write chunk: %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close request body: %v", err)
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("write request: %v", err)
+	}
+
+	encoded := out.Bytes()
+	if !bytes.Contains(encoded, []byte("Transfer-Encoding: chunked\r\n")) {
+		t.Fatalf("missing chunked header: %q", encoded)
+	}
+	if !bytes.Contains(encoded, []byte("Trailer: x-origin-status\r\n")) {
+		t.Fatalf("missing trailer declaration: %q", encoded)
+	}
+	if !bytes.Contains(encoded, []byte("5\r\nhello\r\n0\r\nx-origin-status: stale\r\n\r\n")) {
+		t.Fatalf("unexpected chunked request wire: %q", encoded)
+	}
+}
+
 func TestConnReadResponseKeepAliveFalse(t *testing.T) {
 	input := bytes.NewBufferString("HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 2\r\n\r\nok")
 	conn := NewConn(input, nil)

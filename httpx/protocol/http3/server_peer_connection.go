@@ -237,6 +237,17 @@ func (c *ServerPeerConnection) LocalControlPayload() []byte {
 	return nil
 }
 
+func (c *ServerPeerConnection) FlushLocalEncoderStream() error {
+	if c == nil || c.streams == nil || c.session == nil {
+		return nil
+	}
+	writer, err := c.streams.OpenEncoderStream()
+	if err != nil {
+		return err
+	}
+	return c.session.WriteEncoderStream(writer)
+}
+
 func (c *ServerPeerConnection) LocalEncoderPayload() []byte {
 	if c == nil || c.streams == nil {
 		return nil

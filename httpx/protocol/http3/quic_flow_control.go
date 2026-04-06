@@ -200,6 +200,28 @@ func (s *quicFlowControlState) consumeAllStream(streamID uint64) {
 	s.pendingMaxData = true
 }
 
+// consumeConnectionOnly updates connection-level flow control counters from
+// a specific stream's consumed bytes, but does NOT set stream.pendingMaxData,
+// so no MAX_STREAM_DATA will be generated for this stream (RFC 9000 §19.9).
+// Use for peer-initiated unidirectional streams (control, QPACK encoder/decoder).
+func (s *quicFlowControlState) consumeConnectionOnly(streamID uint64, consumedThrough uint64) {
+	if s == nil {
+		return
+	}
+	s.ensureDefaults()
+	stream := s.ensureStream(streamID)
+	if consumedThrough <= stream.consumedBytes {
+		return
+	}
+	delta := consumedThrough - stream.consumedBytes
+	stream.consumedBytes = consumedThrough
+	s.consumedBytes += delta
+	s.localMaxData += delta
+	// Intentionally do NOT set stream.pendingMaxData.
+	// The server must not send MAX_STREAM_DATA for streams it did not initiate.
+	s.pendingMaxData = true
+}
+
 func (s *quicFlowControlState) observeMaxData(maximumData uint64) {
 	s.ensureDefaults()
 	if maximumData > s.peerMaxData {
@@ -322,6 +344,14 @@ func (s *quicFlowControlState) availableStreamWindow(streamID uint64) uint64 {
 }
 
 func (s *quicFlowControlState) drainPendingMaxFrames() ([]byte, error) {
+	return s.drainPendingMaxFramesFiltered(nil)
+}
+
+// drainPendingMaxFramesFiltered is like drainPendingMaxFrames but only
+// generates MAX_STREAM_DATA for streams where allow returns true.
+// RFC 9000 §19.9: MAX_STREAM_DATA can only be sent for a stream that
+// was initiated by the receiver.
+func (s *quicFlowControlState) drainPendingMaxFramesFiltered(allow func(streamID uint64) bool) ([]byte, error) {
 	if s == nil {
 		return nil, nil
 	}
@@ -341,6 +371,10 @@ func (s *quicFlowControlState) drainPendingMaxFrames() ([]byte, error) {
 	streamIDs := make([]uint64, 0, len(s.streams))
 	for streamID, stream := range s.streams {
 		if stream.pendingMaxData {
+			if allow != nil && !allow(streamID) {
+				stream.pendingMaxData = false
+				continue
+			}
 			streamIDs = append(streamIDs, streamID)
 		}
 	}

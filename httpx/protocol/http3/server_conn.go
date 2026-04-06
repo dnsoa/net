@@ -548,7 +548,7 @@ func (c *ServerConn) consumeBufferedControlFrames() error {
 				c.state.LastMachineStep = ServerConnMachineStepControlStreamPending
 				c.state.ControlBytesConsumed = offset
 				if c.state.LastControlStreamID != 0 {
-					c.ConsumeStreamData(c.state.LastControlStreamID, c.lookupPeerStreamPrefixLength(c.state.LastControlStreamID)+uint64(offset))
+					c.ConsumeConnectionData(c.state.LastControlStreamID, c.lookupPeerStreamPrefixLength(c.state.LastControlStreamID)+uint64(offset))
 				}
 				return nil
 			}
@@ -560,7 +560,7 @@ func (c *ServerConn) consumeBufferedControlFrames() error {
 			c.state.LastMachineStep = ServerConnMachineStepControlStreamPending
 			c.state.ControlBytesConsumed = offset
 			if c.state.LastControlStreamID != 0 {
-				c.ConsumeStreamData(c.state.LastControlStreamID, c.lookupPeerStreamPrefixLength(c.state.LastControlStreamID)+uint64(offset))
+				c.ConsumeConnectionData(c.state.LastControlStreamID, c.lookupPeerStreamPrefixLength(c.state.LastControlStreamID)+uint64(offset))
 			}
 			return nil
 		}
@@ -573,7 +573,7 @@ func (c *ServerConn) consumeBufferedControlFrames() error {
 	c.state.ControlBytesConsumed = offset
 	if consumedAny || offset == len(controlPayload) {
 		if c.state.LastControlStreamID != 0 {
-			c.ConsumeStreamData(c.state.LastControlStreamID, c.lookupPeerStreamPrefixLength(c.state.LastControlStreamID)+uint64(offset))
+			c.ConsumeConnectionData(c.state.LastControlStreamID, c.lookupPeerStreamPrefixLength(c.state.LastControlStreamID)+uint64(offset))
 		}
 		c.state.LastMachineStep = ServerConnMachineStepControlStream
 		return nil
@@ -714,7 +714,7 @@ func (c *ServerConn) consumeBufferedQPACKEncoderStream(closed bool) error {
 	}
 	c.state.EncoderBytesConsumed = len(encoderPayload)
 	if c.state.LastEncoderStreamID != 0 {
-		c.ConsumeStreamData(c.state.LastEncoderStreamID, c.lookupPeerStreamPrefixLength(c.state.LastEncoderStreamID)+uint64(c.state.EncoderBytesConsumed))
+		c.ConsumeConnectionData(c.state.LastEncoderStreamID, c.lookupPeerStreamPrefixLength(c.state.LastEncoderStreamID)+uint64(c.state.EncoderBytesConsumed))
 	}
 	c.state.LastMachineStep = ServerConnMachineStepQPACKEncoderStream
 	return nil
@@ -739,7 +739,7 @@ func (c *ServerConn) consumeBufferedQPACKDecoderStream(closed bool) error {
 	}
 	c.state.DecoderBytesConsumed = len(decoderPayload)
 	if c.state.LastDecoderStreamID != 0 {
-		c.ConsumeStreamData(c.state.LastDecoderStreamID, c.lookupPeerStreamPrefixLength(c.state.LastDecoderStreamID)+uint64(c.state.DecoderBytesConsumed))
+		c.ConsumeConnectionData(c.state.LastDecoderStreamID, c.lookupPeerStreamPrefixLength(c.state.LastDecoderStreamID)+uint64(c.state.DecoderBytesConsumed))
 	}
 	c.state.LastMachineStep = ServerConnMachineStepQPACKDecoderStream
 	return nil
@@ -1107,6 +1107,7 @@ func (c *ServerConn) parseApplicationPackets(space QUICPacketNumberSpace, payloa
 		return nil, false, false, io.EOF
 	}
 	if !looksLikeQUICFrameSequence(payload[0]) {
+		slog.Debug("http3 frame parse: not quic frame sequence, treating as stream data", slog.Int("payload_len", len(payload)), slog.Int("first_byte", int(payload[0])))
 		return []applicationPacket{{StreamID: implicitRequestStreamID, Payload: payload}}, false, false, nil
 	}
 	frames := make([]applicationPacket, 0, 2)
@@ -1301,6 +1302,16 @@ func (c *ServerConn) parseApplicationPackets(space QUICPacketNumberSpace, payloa
 		}
 		frames = append(frames, frame)
 		offset += consumed
+	}
+	if len(frames) == 0 && !consumedControl {
+		preview := payload
+		if len(preview) > 32 {
+			preview = preview[:32]
+		}
+		slog.Debug("http3 frame parse: no frames parsed, packet ignored",
+			slog.Int("payload_len", len(payload)),
+			slog.Int("first_byte", int(payload[0])),
+			slog.String("preview_hex", fmt.Sprintf("%x", preview)))
 	}
 	return frames, false, consumedControl, nil
 }
@@ -1590,7 +1601,12 @@ func (c *ServerConn) DrainPendingFlowControlFrames() ([]byte, error) {
 	if c == nil {
 		return nil, errors.New("http3 server connection is not configured")
 	}
-	return c.state.flowControl.drainPendingMaxFrames()
+	// RFC 9000 §19.9: MAX_STREAM_DATA can only be sent for a stream that
+	// was initiated by the receiver. For a server, the receiver-initiated
+	// bidirectional streams are those with streamID % 4 == 0.
+	return c.state.flowControl.drainPendingMaxFramesFiltered(func(streamID uint64) bool {
+		return streamID%4 == 0
+	})
 }
 
 func (c *ServerConn) ConsumeStreamData(streamID uint64, consumedThrough uint64) {
@@ -1600,8 +1616,24 @@ func (c *ServerConn) ConsumeStreamData(streamID uint64, consumedThrough uint64) 
 	c.state.flowControl.consumeStream(streamID, consumedThrough)
 }
 
+// ConsumeConnectionData updates only connection-level flow control without
+// setting per-stream pendingMaxData. Use for peer-initiated unidirectional
+// streams where the server must not send MAX_STREAM_DATA (RFC 9000 §19.9).
+func (c *ServerConn) ConsumeConnectionData(streamID uint64, consumedThrough uint64) {
+	if c == nil {
+		return
+	}
+	c.state.flowControl.consumeConnectionOnly(streamID, consumedThrough)
+}
+
 func (c *ServerConn) observeReceivedStreamFrame(packet applicationPacket) error {
 	if c == nil || !packet.IsStreamFrame {
+		return nil
+	}
+	// RFC 9000 §19.9: A receiver only counts data received on streams
+	// initiated by the receiver for connection and stream flow control.
+	// Skip flow control tracking for peer-initiated unidirectional streams.
+	if c.Session != nil && isPeerUnidirectionalStream(c.Session, packet.StreamID) {
 		return nil
 	}
 	return c.state.flowControl.observeReceivedStream(packet.StreamID, packet.StreamOffset, len(packet.Payload))

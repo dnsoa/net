@@ -90,8 +90,13 @@ func (c *Conn) WriteRequest(req *core.Request) error {
 	}
 	c.keepAlive = req.Headers.IsKeepAlive(req.Version)
 
-	// Ensure Content-Length header is present when body exists
-	if req.Body != nil && req.ContentLength > 0 {
+	// Ensure framing headers are present when body exists.
+	declaredTrailers := false
+	if req.Body != nil && req.Headers.IsChunked() {
+		req.Headers.RemoveAll(core.HeaderContentLength)
+		ensureTrailerDeclaration(&req.Headers, &req.Trailers)
+		declaredTrailers = req.Headers.Get("Trailer") != nil
+	} else if req.Body != nil && req.ContentLength > 0 {
 		ensureRequestContentLength(req, int(req.ContentLength))
 	}
 
@@ -113,6 +118,9 @@ func (c *Conn) WriteRequest(req *core.Request) error {
 
 	// Stream body if present
 	if req.Body != nil {
+		if req.Headers.IsChunked() {
+			return writeChunkedBody(c.writer, req.Body, &req.Trailers, declaredTrailers)
+		}
 		if _, err := io.Copy(c.writer, req.Body); err != nil {
 			return err
 		}
@@ -540,6 +548,52 @@ func appendChunkedBody(dst, body []byte, trailers *core.Headers) []byte {
 	}
 	dst = append(dst, '\r', '\n')
 	return dst
+}
+
+func writeChunkedBody(w io.Writer, body io.Reader, trailers *core.Headers, writeTrailers bool) error {
+	if w == nil {
+		return errors.New("http1 writer is nil")
+	}
+	if body == nil {
+		_, err := io.WriteString(w, "0\r\n\r\n")
+		return err
+	}
+
+	buf := make([]byte, 32*1024)
+	for {
+		n, err := body.Read(buf)
+		if n > 0 {
+			if _, writeErr := io.WriteString(w, strconv.FormatInt(int64(n), 16)); writeErr != nil {
+				return writeErr
+			}
+			if _, writeErr := io.WriteString(w, "\r\n"); writeErr != nil {
+				return writeErr
+			}
+			if _, writeErr := w.Write(buf[:n]); writeErr != nil {
+				return writeErr
+			}
+			if _, writeErr := io.WriteString(w, "\r\n"); writeErr != nil {
+				return writeErr
+			}
+		}
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			return err
+		}
+	}
+
+	if _, err := io.WriteString(w, "0\r\n"); err != nil {
+		return err
+	}
+	if writeTrailers && trailers != nil && trailers.Count() > 0 {
+		if _, err := w.Write(trailers.Serialize(nil)); err != nil {
+			return err
+		}
+	}
+	_, err := io.WriteString(w, "\r\n")
+	return err
 }
 
 func ensureTrailerDeclaration(headers, trailers *core.Headers) {
