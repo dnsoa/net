@@ -1,4 +1,4 @@
-module github.com/dnsoa/net/xk6http3
+module github.com/dnsoa/net/xk6-http3
 
 go 1.26.1
 
