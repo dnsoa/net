@@ -350,19 +350,21 @@ func (c *Conn) WriteResponseHead(resp *core.Response) (io.Writer, error) {
 		return nil, errors.New("http1 writer is nil")
 	}
 
-	buf := make([]byte, 0, 512)
-	buf = append(buf, resp.Version.String()...)
-	buf = append(buf, ' ')
-	buf = strconv.AppendInt(buf, int64(resp.Status.Code), 10)
-	buf = append(buf, ' ')
-	buf = append(buf, resp.Status.Phrase()...)
-	buf = append(buf, '\r', '\n')
-	buf = resp.Headers.Serialize(buf)
-	buf = append(buf, '\r', '\n')
+	if cap(c.writeBuf) < 512 {
+		c.writeBuf = make([]byte, 0, 512)
+	}
+	c.writeBuf = append(c.writeBuf[:0], resp.Version.String()...)
+	c.writeBuf = append(c.writeBuf, ' ')
+	c.writeBuf = strconv.AppendInt(c.writeBuf, int64(resp.Status.Code), 10)
+	c.writeBuf = append(c.writeBuf, ' ')
+	c.writeBuf = append(c.writeBuf, resp.Status.Phrase()...)
+	c.writeBuf = append(c.writeBuf, '\r', '\n')
+	c.writeBuf = resp.Headers.Serialize(c.writeBuf)
+	c.writeBuf = append(c.writeBuf, '\r', '\n')
 
 	c.keepAlive = resp.Headers.IsKeepAlive(resp.Version)
 
-	if _, err := c.writer.Write(buf); err != nil {
+	if _, err := c.writer.Write(c.writeBuf); err != nil {
 		return nil, err
 	}
 

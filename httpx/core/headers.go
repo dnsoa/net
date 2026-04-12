@@ -26,17 +26,86 @@ type Headers struct {
 	entries []HeaderEntry
 }
 
+type bufferState struct {
+	buf     *allocator.Buffer
+	kept    bool
+	removed bool
+}
+
 func NewHeaders() Headers {
 	return Headers{}
 }
 
 func (h *Headers) Reset() {
-	alloc := getDefaultAllocator()
+	releaseUniqueBuffers(h.entries)
 	for i := range h.entries {
-		alloc.Put(h.entries[i].buf)
 		h.entries[i] = HeaderEntry{}
 	}
 	h.entries = h.entries[:0]
+}
+
+func releaseUniqueBuffers(entries []HeaderEntry) {
+	if len(entries) == 0 {
+		return
+	}
+	alloc := getDefaultAllocator()
+	var seenBufs [8]*allocator.Buffer
+	seen := seenBufs[:0]
+	for i := range entries {
+		buf := entries[i].buf
+		if buf == nil {
+			continue
+		}
+		duplicate := false
+		for _, known := range seen {
+			if known == buf {
+				duplicate = true
+				break
+			}
+		}
+		if duplicate {
+			continue
+		}
+		seen = append(seen, buf)
+		_ = alloc.Put(buf)
+	}
+}
+
+func markBufferState(states []bufferState, buf *allocator.Buffer, kept bool) []bufferState {
+	if buf == nil {
+		return states
+	}
+	for i := range states {
+		if states[i].buf != buf {
+			continue
+		}
+		if kept {
+			states[i].kept = true
+		} else {
+			states[i].removed = true
+		}
+		return states
+	}
+	state := bufferState{buf: buf}
+	if kept {
+		state.kept = true
+	} else {
+		state.removed = true
+	}
+	return append(states, state)
+}
+
+func releaseRemovedExclusiveBuffers(states []bufferState) {
+	if len(states) == 0 {
+		return
+	}
+	alloc := getDefaultAllocator()
+	for i := range states {
+		if !states[i].removed || states[i].kept || states[i].buf == nil {
+			continue
+		}
+		_ = alloc.Put(states[i].buf)
+	}
 }
 
 func (h *Headers) Count() int {
@@ -134,39 +203,78 @@ func (h *Headers) GetAll(name string) [][]byte {
 }
 
 func (h *Headers) RemoveAll(name []byte) {
-	alloc := getDefaultAllocator()
+	if len(h.entries) == 0 {
+		return
+	}
+	var stateBuf [8]bufferState
+	states := stateBuf[:0]
 	out := h.entries[:0]
 	for _, entry := range h.entries {
-		if bytes.EqualFold(entry.Name, name) {
-			alloc.Put(entry.buf)
+		removed := bytes.EqualFold(entry.Name, name)
+		states = markBufferState(states, entry.buf, !removed)
+		if removed {
 			continue
 		}
 		out = append(out, entry)
 	}
+	for i := len(out); i < len(h.entries); i++ {
+		h.entries[i] = HeaderEntry{}
+	}
+	releaseRemovedExclusiveBuffers(states)
 	h.entries = out
 }
 
 // RemoveAllString removes all entries with the given header name (string).
 // Avoids temporary []byte allocation from string conversion.
 func (h *Headers) RemoveAllString(name string) {
-	alloc := getDefaultAllocator()
+	if len(h.entries) == 0 {
+		return
+	}
+	var stateBuf [8]bufferState
+	states := stateBuf[:0]
 	out := h.entries[:0]
 	for _, entry := range h.entries {
-		if equalFoldString(entry.Name, name) {
-			alloc.Put(entry.buf)
+		removed := equalFoldString(entry.Name, name)
+		states = markBufferState(states, entry.buf, !removed)
+		if removed {
 			continue
 		}
 		out = append(out, entry)
 	}
+	for i := len(out); i < len(h.entries); i++ {
+		h.entries[i] = HeaderEntry{}
+	}
+	releaseRemovedExclusiveBuffers(states)
 	h.entries = out
 }
 
 func (h *Headers) Clone() Headers {
-	clone := NewHeaders()
-	for _, entry := range h.entries {
-		clone.Append(entry.Name, entry.Value)
+	if len(h.entries) == 0 {
+		return NewHeaders()
 	}
-	return clone
+
+	totalLen := 0
+	for _, entry := range h.entries {
+		totalLen += len(entry.Name) + len(entry.Value)
+	}
+
+	alloc := getDefaultAllocator()
+	buf := alloc.Get(totalLen)
+	entries := make([]HeaderEntry, len(h.entries))
+	offset := 0
+	for i, entry := range h.entries {
+		nameLen := len(entry.Name)
+		valueLen := len(entry.Value)
+		copy((*buf)[offset:offset+nameLen], entry.Name)
+		copy((*buf)[offset+nameLen:offset+nameLen+valueLen], entry.Value)
+		entries[i] = HeaderEntry{
+			Name:  (*buf)[offset : offset+nameLen],
+			Value: (*buf)[offset+nameLen : offset+nameLen+valueLen],
+			buf:   buf,
+		}
+		offset += nameLen + valueLen
+	}
+	return Headers{entries: entries}
 }
 
 func (h *Headers) ContentLength() (int, bool) {

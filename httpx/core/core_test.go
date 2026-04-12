@@ -32,6 +32,68 @@ func TestHeadersCaseInsensitive(t *testing.T) {
 	}
 }
 
+func TestHeadersCloneIsolation(t *testing.T) {
+	h := NewHeaders()
+	defer h.Reset()
+	h.AppendString("Content-Type", "application/json")
+	h.AppendString("X-Test", "original")
+
+	clone := h.Clone()
+	defer clone.Reset()
+	clone.SetString("X-Test", "mutated")
+
+	if got := string(h.Get("X-Test")); got != "original" {
+		t.Fatalf("unexpected original header value %q", got)
+	}
+	if got := string(clone.Get("X-Test")); got != "mutated" {
+		t.Fatalf("unexpected cloned header value %q", got)
+	}
+}
+
+func TestHeadersCloneResetAndRemoveAll(t *testing.T) {
+	h := NewHeaders()
+	defer h.Reset()
+	h.AppendString("Content-Type", "text/plain")
+	h.AppendString("Cache-Control", "max-age=60")
+	h.AppendString("X-Test", "value")
+
+	clone := h.Clone()
+	clone.RemoveAllString("Cache-Control")
+	if got := clone.Get("Cache-Control"); got != nil {
+		t.Fatalf("expected cache-control removed, got %q", got)
+	}
+	clone.Reset()
+}
+
+func TestHeadersCloneRemoveAllPreservesRemainingEntries(t *testing.T) {
+	h := NewHeaders()
+	defer h.Reset()
+	h.AppendString("Content-Type", "text/plain")
+	h.AppendString("Cache-Control", "max-age=60")
+	h.AppendString("ETag", "bench-tag")
+
+	clone := h.Clone()
+	defer clone.Reset()
+	clone.RemoveAllString("Cache-Control")
+	clone.SetString("X-New", "value")
+
+	if got := string(clone.Get("Content-Type")); got != "text/plain" {
+		t.Fatalf("unexpected content-type after remove: %q", got)
+	}
+	if got := string(clone.Get("ETag")); got != "bench-tag" {
+		t.Fatalf("unexpected etag after remove: %q", got)
+	}
+	if got := clone.Get("Cache-Control"); got != nil {
+		t.Fatalf("expected cache-control removed, got %q", got)
+	}
+	if got := string(clone.Get("X-New")); got != "value" {
+		t.Fatalf("unexpected x-new after insert: %q", got)
+	}
+	if got := string(h.Get("ETag")); got != "bench-tag" {
+		t.Fatalf("unexpected original etag after clone mutation: %q", got)
+	}
+}
+
 func TestURIParse(t *testing.T) {
 	uri, err := ParseURI("https://example.com:8443/search?q=zig#frag")
 	if err != nil {
@@ -117,6 +179,20 @@ func BenchmarkHeadersGet(b *testing.B) {
 		h.Get("Content-Length")
 		h.Get("X-CUSTOM-HEADER")
 	}
+}
+
+func BenchmarkHeadersClone(b *testing.B) {
+	h := NewHeaders()
+	h.AppendString("Content-Type", "application/json")
+	h.AppendString("Content-Length", "1234")
+	h.AppendString("Cache-Control", "public, max-age=300")
+	h.AppendString("ETag", "abc123")
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		clone := h.Clone()
+		clone.Reset()
+	}
+	h.Reset()
 }
 
 // ============================================================================

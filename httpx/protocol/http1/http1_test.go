@@ -74,6 +74,53 @@ func TestConnWriteResponse(t *testing.T) {
 	}
 }
 
+func TestConnWriteResponseHeadReusesWriteBuffer(t *testing.T) {
+	var out bytes.Buffer
+	conn := NewConn(nil, &out)
+	defer conn.Close()
+	conn.writeBuf = make([]byte, 0, 1024)
+
+	resp := core.AcquireResponse()
+	defer core.ReleaseResponse(resp)
+	resp.Status = core.NewStatus(200)
+	resp.Version = core.VersionHTTP11
+	resp.Headers.Set(core.HeaderContentType, []byte("text/plain"))
+
+	writer, err := conn.WriteResponseHead(resp)
+	if err != nil {
+		t.Fatalf("write response head: %v", err)
+	}
+	if writer != &out {
+		t.Fatalf("unexpected returned writer %T", writer)
+	}
+	if len(conn.writeBuf) == 0 {
+		t.Fatal("expected serialized response head to remain in conn.writeBuf")
+	}
+	if cap(conn.writeBuf) != 1024 {
+		t.Fatalf("expected existing write buffer to be reused, cap=%d", cap(conn.writeBuf))
+	}
+	if !bytes.Contains(out.Bytes(), []byte("HTTP/1.1 200 OK\r\n")) {
+		t.Fatalf("unexpected response head: %q", out.Bytes())
+	}
+	if !bytes.Contains(out.Bytes(), []byte("Content-Type: text/plain\r\n")) {
+		t.Fatalf("missing response header: %q", out.Bytes())
+	}
+	if !bytes.HasSuffix(out.Bytes(), []byte("\r\n\r\n")) {
+		t.Fatalf("response head missing terminal CRLF: %q", out.Bytes())
+	}
+	if !conn.ShouldKeepAlive() {
+		t.Fatal("expected HTTP/1.1 response head to default to keep-alive")
+	}
+
+	out.Reset()
+	if _, err := conn.WriteResponseHead(resp); err != nil {
+		t.Fatalf("write response head second time: %v", err)
+	}
+	if cap(conn.writeBuf) != 1024 {
+		t.Fatalf("expected second write to reuse buffer, cap=%d", cap(conn.writeBuf))
+	}
+}
+
 func TestFormatResponseChunked(t *testing.T) {
 	resp := core.AcquireResponse()
 	defer core.ReleaseResponse(resp)
