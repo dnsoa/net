@@ -1,5 +1,5 @@
 // Package xk6http3 provides a k6 extension module for making HTTP/3 requests.
-package xk6-http3
+package xk6http3
 
 import (
 	"context"
