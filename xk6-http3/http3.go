@@ -28,6 +28,7 @@ type RootModule struct {
 }
 
 type http3Metrics struct {
+	reqs         *metrics.Metric
 	reqDuration  *metrics.Metric
 	reqWaiting   *metrics.Metric
 	reqReceiving *metrics.Metric
@@ -41,6 +42,7 @@ func (rm *RootModule) NewModuleInstance(vu modules.VU) modules.Instance {
 	rm.metricsOnce.Do(func() {
 		reg := vu.InitEnv().Registry
 		rm.m = &http3Metrics{
+			reqs:         reg.MustNewMetric("http3_reqs", metrics.Counter),
 			reqDuration:  reg.MustNewMetric("http3_req_duration", metrics.Trend, metrics.Time),
 			reqWaiting:   reg.MustNewMetric("http3_req_waiting", metrics.Trend, metrics.Time),
 			reqReceiving: reg.MustNewMetric("http3_req_receiving", metrics.Trend, metrics.Time),
@@ -117,6 +119,12 @@ func (mi *ModuleInstance) emitMetrics(ttfb, receiving time.Duration, method, url
 
 	now := time.Now()
 	samples := metrics.Samples{
+		{
+			TimeSeries: metrics.TimeSeries{Metric: mi.m.reqs, Tags: reqTags},
+			Time:       now,
+			Value:      1,
+			Metadata:   tags.Metadata,
+		},
 		{
 			TimeSeries: metrics.TimeSeries{Metric: mi.m.reqDuration, Tags: reqTags},
 			Time:       now,
