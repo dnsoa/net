@@ -3,17 +3,8 @@ package core
 import (
 	"bytes"
 	"io"
-	"os"
-	"sync"
 	"testing"
-
-	"github.com/dnsoa/go/allocator"
 )
-
-func TestMain(m *testing.M) {
-	SetDefaultAllocator(allocator.New())
-	os.Exit(m.Run())
-}
 
 func initRequest(req *Request, method Method, rawURL string) {
 	req.Method = method
@@ -171,45 +162,6 @@ func TestContainsTokenCIAcceptsHTABOWS(t *testing.T) {
 				t.Fatalf("ContainsTokenCI(%q, %q) = %v, want %v", tt.haystack, tt.needle, got, tt.want)
 			}
 		})
-	}
-}
-
-func TestDefaultAllocatorConcurrentSetAndGet(t *testing.T) {
-	custom := allocator.New()
-	SetDefaultAllocator(nil)
-
-	var wg sync.WaitGroup
-	errCh := make(chan string, 64)
-	start := make(chan struct{})
-
-	for i := 0; i < 32; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			<-start
-			if got := DefaultAllocator(); got == nil {
-				errCh <- "DefaultAllocator returned nil"
-			}
-		}()
-	}
-
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		<-start
-		SetDefaultAllocator(custom)
-	}()
-
-	close(start)
-	wg.Wait()
-	close(errCh)
-
-	for err := range errCh {
-		t.Fatal(err)
-	}
-
-	if got := DefaultAllocator(); got != custom {
-		t.Fatalf("DefaultAllocator() = %p, want %p", got, custom)
 	}
 }
 

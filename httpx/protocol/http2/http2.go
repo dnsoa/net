@@ -6,7 +6,6 @@ import (
 	"io"
 
 	"github.com/dnsoa/go/allocator"
-	"github.com/dnsoa/net/httpx/core"
 )
 
 const (
@@ -171,7 +170,7 @@ type Frame struct {
 // Release returns the payload buffer to the allocator.
 func (f *Frame) Release() {
 	if f.allocBuf != nil {
-		core.DefaultAllocator().Put(f.allocBuf)
+		_ = allocator.Release(f.allocBuf)
 		f.allocBuf = nil
 		f.Payload = nil
 	}
@@ -223,10 +222,10 @@ func (c *Conn) ReadFrame(maxPayloadSize int) (Frame, error) {
 	}
 	var frame Frame
 	if header.Length > 0 {
-		buf := core.DefaultAllocator().Get(int(header.Length))
+		buf := allocator.Get(int(header.Length))
 		frame = Frame{Header: header, Payload: (*buf)[:header.Length], allocBuf: buf}
 		if _, err := io.ReadFull(c.reader, frame.Payload); err != nil {
-			core.DefaultAllocator().Put(buf)
+			allocator.Release(buf)
 			return Frame{}, err
 		}
 	} else {

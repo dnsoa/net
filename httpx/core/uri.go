@@ -21,20 +21,31 @@ type URI struct {
 	rawBuf   *allocator.Buffer
 }
 
+var defaultPath = []byte("/")
+
 func (u *URI) Reset() {
-	alloc := DefaultAllocator()
 	if u.rawBuf != nil {
-		alloc.Put(u.rawBuf)
+		_ = allocator.Release(u.rawBuf)
+		u.rawBuf = nil
 	}
-	*u = URI{Path: []byte("/")}
+	u.Raw = nil
+	u.Scheme = nil
+	u.UserInfo = nil
+	u.Host = nil
+	u.Path = defaultPath
+	u.Query = nil
+	u.Fragment = nil
+	u.Port = 0
+	u.HasPort = false
 }
 
 func (u *URI) ParseString(raw string) error {
-	alloc := DefaultAllocator()
 	if u.rawBuf != nil {
-		alloc.Put(u.rawBuf)
+		if err := allocator.Release(u.rawBuf); err != nil {
+			return err
+		}
 	}
-	buf := alloc.Get(len(raw))
+	buf := allocator.Get(len(raw))
 	copy(*buf, raw)
 	u.rawBuf = buf
 	u.parse(*buf)
@@ -42,11 +53,12 @@ func (u *URI) ParseString(raw string) error {
 }
 
 func (u *URI) ParseOwned(raw []byte) error {
-	alloc := DefaultAllocator()
 	if u.rawBuf != nil {
-		alloc.Put(u.rawBuf)
+		if err := allocator.Release(u.rawBuf); err != nil {
+			return err
+		}
 	}
-	buf := alloc.Get(len(raw))
+	buf := allocator.Get(len(raw))
 	copy(*buf, raw)
 	u.rawBuf = buf
 	u.parse(*buf)
@@ -62,7 +74,7 @@ func (u *URI) parse(raw []byte) {
 	u.Fragment = nil
 	u.Port = 0
 	u.HasPort = false
-	u.Path = []byte("/")
+	u.Path = defaultPath
 
 	remaining := raw
 	if idx := bytes.Index(remaining, []byte("://")); idx >= 0 {
@@ -102,7 +114,7 @@ func (u *URI) parse(raw []byte) {
 		u.Host = remaining
 	}
 	if len(u.Path) == 0 {
-		u.Path = []byte("/")
+		u.Path = defaultPath
 	}
 }
 

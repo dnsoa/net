@@ -48,7 +48,6 @@ func releaseUniqueBuffers(entries []HeaderEntry) {
 	if len(entries) == 0 {
 		return
 	}
-	alloc := DefaultAllocator()
 	var seenBufs [8]*allocator.Buffer
 	seen := seenBufs[:0]
 	for i := range entries {
@@ -67,7 +66,7 @@ func releaseUniqueBuffers(entries []HeaderEntry) {
 			continue
 		}
 		seen = append(seen, buf)
-		_ = alloc.Put(buf)
+		_ = allocator.Release(buf)
 	}
 }
 
@@ -99,12 +98,11 @@ func releaseRemovedExclusiveBuffers(states []bufferState) {
 	if len(states) == 0 {
 		return
 	}
-	alloc := DefaultAllocator()
 	for i := range states {
 		if !states[i].removed || states[i].kept || states[i].buf == nil {
 			continue
 		}
-		_ = alloc.Put(states[i].buf)
+		_ = allocator.Release(states[i].buf)
 	}
 }
 
@@ -118,8 +116,7 @@ func (h *Headers) Entries() []HeaderEntry {
 
 func (h *Headers) Append(name, value []byte) {
 	totalLen := len(name) + len(value)
-	alloc := DefaultAllocator()
-	buf := alloc.Get(totalLen)
+	buf := allocator.Get(totalLen)
 	nLen := len(name)
 	copy((*buf)[:nLen], name)
 	copy((*buf)[nLen:], value)
@@ -134,8 +131,7 @@ func (h *Headers) Append(name, value []byte) {
 // Avoids temporary []byte allocations by converting directly into the owned buffer.
 func (h *Headers) AppendString(name, value string) {
 	totalLen := len(name) + len(value)
-	alloc := DefaultAllocator()
-	buf := alloc.Get(totalLen)
+	buf := allocator.Get(totalLen)
 	nLen := len(name)
 	copy((*buf)[:nLen], name)
 	copy((*buf)[nLen:], value)
@@ -258,8 +254,7 @@ func (h *Headers) Clone() Headers {
 		totalLen += len(entry.Name) + len(entry.Value)
 	}
 
-	alloc := DefaultAllocator()
-	buf := alloc.Get(totalLen)
+	buf := allocator.Get(totalLen)
 	entries := make([]HeaderEntry, len(h.entries))
 	offset := 0
 	for i, entry := range h.entries {
