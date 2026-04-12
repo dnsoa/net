@@ -48,7 +48,7 @@ func releaseUniqueBuffers(entries []HeaderEntry) {
 	if len(entries) == 0 {
 		return
 	}
-	alloc := getDefaultAllocator()
+	alloc := DefaultAllocator()
 	var seenBufs [8]*allocator.Buffer
 	seen := seenBufs[:0]
 	for i := range entries {
@@ -99,7 +99,7 @@ func releaseRemovedExclusiveBuffers(states []bufferState) {
 	if len(states) == 0 {
 		return
 	}
-	alloc := getDefaultAllocator()
+	alloc := DefaultAllocator()
 	for i := range states {
 		if !states[i].removed || states[i].kept || states[i].buf == nil {
 			continue
@@ -118,7 +118,7 @@ func (h *Headers) Entries() []HeaderEntry {
 
 func (h *Headers) Append(name, value []byte) {
 	totalLen := len(name) + len(value)
-	alloc := getDefaultAllocator()
+	alloc := DefaultAllocator()
 	buf := alloc.Get(totalLen)
 	nLen := len(name)
 	copy((*buf)[:nLen], name)
@@ -134,7 +134,7 @@ func (h *Headers) Append(name, value []byte) {
 // Avoids temporary []byte allocations by converting directly into the owned buffer.
 func (h *Headers) AppendString(name, value string) {
 	totalLen := len(name) + len(value)
-	alloc := getDefaultAllocator()
+	alloc := DefaultAllocator()
 	buf := alloc.Get(totalLen)
 	nLen := len(name)
 	copy((*buf)[:nLen], name)
@@ -258,7 +258,7 @@ func (h *Headers) Clone() Headers {
 		totalLen += len(entry.Name) + len(entry.Value)
 	}
 
-	alloc := getDefaultAllocator()
+	alloc := DefaultAllocator()
 	buf := alloc.Get(totalLen)
 	entries := make([]HeaderEntry, len(h.entries))
 	offset := 0
@@ -291,17 +291,16 @@ func (h *Headers) ContentLength() (int, bool) {
 
 func (h *Headers) IsChunked() bool {
 	value := h.Get("Transfer-Encoding")
-	return value != nil && bytes.Contains(bytes.ToLower(value), []byte("chunked"))
+	return value != nil && ContainsTokenCI(value, []byte("chunked"))
 }
 
 func (h *Headers) IsKeepAlive(version Version) bool {
 	value := h.Get("Connection")
 	if value != nil {
-		lower := bytes.ToLower(value)
-		if bytes.Contains(lower, []byte("close")) {
+		if ContainsTokenCI(value, []byte("close")) {
 			return false
 		}
-		if bytes.Contains(lower, []byte("keep-alive")) {
+		if ContainsTokenCI(value, []byte("keep-alive")) {
 			return true
 		}
 	}

@@ -52,11 +52,9 @@ func (r *Request) Reset() {
 		r.Body.Close()
 		r.Body = nil
 	}
-	*r = Request{
-		Version:  VersionHTTP11,
-		Headers:  NewHeaders(),
-		Trailers: NewHeaders(),
-	}
+	r.Method = MethodGet
+	r.Version = VersionHTTP11
+	r.ContentLength = 0
 }
 
 // SetBody sets the request body. The caller is responsible for setting

@@ -44,12 +44,9 @@ func (r *Response) Reset() {
 		r.Body.Close()
 		r.Body = nil
 	}
-	*r = Response{
-		Version:  VersionHTTP11,
-		Status:   NewStatus(200),
-		Headers:  NewHeaders(),
-		Trailers: NewHeaders(),
-	}
+	r.Version = VersionHTTP11
+	r.Status = NewStatus(200)
+	r.ContentLength = 0
 }
 
 // SetBody sets the response body. The caller is responsible for setting

@@ -22,7 +22,7 @@ type URI struct {
 }
 
 func (u *URI) Reset() {
-	alloc := getDefaultAllocator()
+	alloc := DefaultAllocator()
 	if u.rawBuf != nil {
 		alloc.Put(u.rawBuf)
 	}
@@ -30,7 +30,7 @@ func (u *URI) Reset() {
 }
 
 func (u *URI) ParseString(raw string) error {
-	alloc := getDefaultAllocator()
+	alloc := DefaultAllocator()
 	if u.rawBuf != nil {
 		alloc.Put(u.rawBuf)
 	}
@@ -42,7 +42,7 @@ func (u *URI) ParseString(raw string) error {
 }
 
 func (u *URI) ParseOwned(raw []byte) error {
-	alloc := getDefaultAllocator()
+	alloc := DefaultAllocator()
 	if u.rawBuf != nil {
 		alloc.Put(u.rawBuf)
 	}

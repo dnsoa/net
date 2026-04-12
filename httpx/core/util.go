@@ -6,11 +6,12 @@ import (
 )
 
 // ContainsTokenCI reports whether haystack contains needle as a token,
-// comparing case-insensitively. Tokens are delimited by commas and optional whitespace.
+// comparing case-insensitively. Tokens are delimited by commas and optional
+// HTTP OWS around each token.
 func ContainsTokenCI(haystack, needle []byte) bool {
 	start := 0
 	for start < len(haystack) {
-		for start < len(haystack) && (haystack[start] == ' ' || haystack[start] == ',') {
+		for start < len(haystack) && (haystack[start] == ',' || isOWS(haystack[start])) {
 			start++
 		}
 		end := start
@@ -18,10 +19,10 @@ func ContainsTokenCI(haystack, needle []byte) bool {
 			end++
 		}
 		token := haystack[start:end]
-		for len(token) > 0 && token[0] == ' ' {
+		for len(token) > 0 && isOWS(token[0]) {
 			token = token[1:]
 		}
-		for len(token) > 0 && token[len(token)-1] == ' ' {
+		for len(token) > 0 && isOWS(token[len(token)-1]) {
 			token = token[:len(token)-1]
 		}
 		if bytes.EqualFold(token, needle) {
@@ -30,6 +31,10 @@ func ContainsTokenCI(haystack, needle []byte) bool {
 		start = end + 1
 	}
 	return false
+}
+
+func isOWS(b byte) bool {
+	return b == ' ' || b == '\t'
 }
 
 func AppendInt(dst []byte, v int) []byte {

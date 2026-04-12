@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"io"
 	"os"
+	"sync"
 	"testing"
 
 	"github.com/dnsoa/go/allocator"
@@ -149,6 +150,67 @@ func TestRequestLifecycle(t *testing.T) {
 	defer ReleaseRequest(req)
 	initRequest(req, MethodPost, "https://example.com/api")
 	req.Headers.SetString("content-type", "application/json")
+}
+
+func TestContainsTokenCIAcceptsHTABOWS(t *testing.T) {
+	tests := []struct {
+		name     string
+		haystack []byte
+		needle   []byte
+		want     bool
+	}{
+		{name: "chunked with tab", haystack: []byte("gzip,\tchunked"), needle: []byte("chunked"), want: true},
+		{name: "keep-alive with tabs", haystack: []byte("\tkeep-alive\t"), needle: []byte("keep-alive"), want: true},
+		{name: "close with mixed ows", haystack: []byte("keep-alive, \tclose\t"), needle: []byte("close"), want: true},
+		{name: "token boundary preserved", haystack: []byte("gzip,\tchunkedx"), needle: []byte("chunked"), want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := ContainsTokenCI(tt.haystack, tt.needle); got != tt.want {
+				t.Fatalf("ContainsTokenCI(%q, %q) = %v, want %v", tt.haystack, tt.needle, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestDefaultAllocatorConcurrentSetAndGet(t *testing.T) {
+	custom := allocator.New()
+	SetDefaultAllocator(nil)
+
+	var wg sync.WaitGroup
+	errCh := make(chan string, 64)
+	start := make(chan struct{})
+
+	for i := 0; i < 32; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			if got := DefaultAllocator(); got == nil {
+				errCh <- "DefaultAllocator returned nil"
+			}
+		}()
+	}
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-start
+		SetDefaultAllocator(custom)
+	}()
+
+	close(start)
+	wg.Wait()
+	close(errCh)
+
+	for err := range errCh {
+		t.Fatal(err)
+	}
+
+	if got := DefaultAllocator(); got != custom {
+		t.Fatalf("DefaultAllocator() = %p, want %p", got, custom)
+	}
 }
 
 // ============================================================================

@@ -2,16 +2,16 @@ package core
 
 import (
 	"sync"
+	"sync/atomic"
 
 	"github.com/dnsoa/go/allocator"
 )
 
-// defaultAlloc is the package-level allocator set explicitly via SetDefaultAllocator.
-var defaultAlloc *allocator.Allocator
-
 var (
-	defaultAllocOnce sync.Once
-	defaultAllocAuto *allocator.Allocator
+	defaultAlloc = sync.OnceValue(func() *allocator.Allocator {
+		return allocator.New()
+	})
+	defaultAllocPtr atomic.Pointer[allocator.Allocator]
 )
 
 // SetDefaultAllocator sets the global default allocator for the core package.
@@ -19,23 +19,20 @@ var (
 // objects will automatically use pooled buffers for header/URI allocations.
 // Should be called once during program initialization.
 func SetDefaultAllocator(a *allocator.Allocator) {
-	defaultAlloc = a
+	if a == nil {
+		return
+	}
+	defaultAllocPtr.Store(a)
 }
 
 // DefaultAllocator returns the package-level allocator shared by core objects.
-// If SetDefaultAllocator was never called, a default allocator is lazily created.
 func DefaultAllocator() *allocator.Allocator {
-	return getDefaultAllocator()
-}
-
-// getDefaultAllocator returns the package-level allocator.
-// If SetDefaultAllocator was never called, a default allocator is lazily created.
-func getDefaultAllocator() *allocator.Allocator {
-	if defaultAlloc != nil {
-		return defaultAlloc
+	if p := defaultAllocPtr.Load(); p != nil {
+		return p
 	}
-	defaultAllocOnce.Do(func() {
-		defaultAllocAuto = allocator.New()
-	})
-	return defaultAllocAuto
+	p := defaultAlloc()
+	if defaultAllocPtr.CompareAndSwap(nil, p) {
+		return p
+	}
+	return defaultAllocPtr.Load()
 }
